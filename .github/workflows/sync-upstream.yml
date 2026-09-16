@@ -1,0 +1,152 @@
+name: Sync Upstream
+
+# Keeps the fork's main aligned with pingdotgg/t3code's main, but only ever
+# moves main to a merge candidate that has a fully green CI run. Merge
+# conflicts or red CI leave main untouched and fail this workflow, so the
+# failure itself is the signal to resolve manually.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # push sync/main and fast-forward main
+  actions: write # dispatch CI from trusted main and read the dispatched run
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream main
+        run: |
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git fetch --no-tags upstream main
+
+      - name: Check whether already up to date
+        id: status
+        run: |
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "upstream/main is already contained in main; nothing to sync."
+          fi
+
+      - name: Build merge candidate on sync/main
+        id: candidate
+        if: steps.status.outputs.up_to_date != 'true'
+        run: |
+          set -euo pipefail
+          git checkout -B sync/main origin/main
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort
+            echo "::error::Merging upstream/main produced conflicts; nothing was pushed. Resolve manually: git fetch upstream && git checkout main && git merge upstream/main, then push."
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify fork CI adaptations survived the merge
+        # Guards against an upstream change silently replacing this workflow's
+        # assumptions on the candidate: the sync workflow itself must still
+        # exist, and ci.yml must still accept the candidate_sha input that
+        # gates promotion on a trusted CI run. A conflict would already have
+        # aborted the merge above; this catches clean but hostile rewrites.
+        if: steps.status.outputs.up_to_date != 'true'
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/sync-upstream.yml || {
+            echo "::error::sync-upstream.yml vanished after the upstream merge; main was not touched."
+            exit 1
+          }
+          grep -q 'candidate_sha' .github/workflows/ci.yml || {
+            echo "::error::ci.yml no longer accepts the candidate_sha input; main was not touched."
+            exit 1
+          }
+
+      - name: Push candidate
+        if: steps.status.outputs.up_to_date != 'true'
+        run: git push origin sync/main --force
+
+      - name: Start CI on the candidate
+        # A push made with this workflow's GITHUB_TOKEN would not trigger new
+        # workflow runs (GitHub blocks token-recursive triggers), so start CI
+        # explicitly. Dispatch from trusted main and pass the candidate SHA as
+        # an input: running ci.yml from the candidate ref would let a poisoned
+        # candidate weaken or disable the very CI that gates it.
+        # return_run_details makes the API return the created run so the next
+        # step can poll exactly this run instead of every check run on the SHA.
+        id: dispatch
+        if: steps.status.outputs.up_to_date != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          response="$(gh api -X POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/dispatches?return_run_details=true" \
+            -f ref=main -F "inputs[candidate_sha]=${SHA}")"
+          echo "run_id=$(jq -r .workflow_run_id <<< "$response")" >> "$GITHUB_OUTPUT"
+          echo "run_url=$(jq -r .html_url <<< "$response")" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CI to pass on the candidate
+        if: steps.status.outputs.up_to_date != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ steps.dispatch.outputs.run_id }}
+          RUN_URL: ${{ steps.dispatch.outputs.run_url }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 90 * 60 ))
+
+          while :; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Timed out after 90 minutes waiting for ${RUN_URL}; main was not touched."
+              exit 1
+            fi
+
+            # The dispatched run may take a few seconds to become visible;
+            # treat a lookup failure as "still running" rather than aborting.
+            status="$(gh run view "${RUN_ID}" --json status,conclusion --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+
+            if [ -z "$status" ]; then
+              echo "Run not visible yet: ${RUN_URL}; retrying in 60s."
+            else
+              case "$status" in
+                completed$'\t'success)
+                  echo "CI passed: ${RUN_URL}"
+                  exit 0
+                  ;;
+                completed$'\t'*)
+                  echo "::error::CI did not pass (${status#*$'\t'}): ${RUN_URL}; main was not touched. Inspect the run and fix before the next sync."
+                  exit 1
+                  ;;
+                *)
+                  echo "CI still running (${status%%$'\t'*}): ${RUN_URL}; retrying in 60s."
+                  ;;
+              esac
+            fi
+
+            sleep 60
+          done
+
+      - name: Fast-forward main to the candidate
+        # Only reachable with a fully green candidate. The push is a fast
+        # forward because sync/main is main plus the upstream merge; if main
+        # moved in the meantime the push is rejected and the workflow fails.
+        if: steps.status.outputs.up_to_date != 'true'
+        run: git push origin sync/main:main

@@ -1,10 +1,22 @@
 name: CI
 
+# workflow_dispatch lets the upstream-sync workflow test a sync candidate: it
+# dispatches this file *from trusted main* and passes the candidate SHA as the
+# candidate_sha input, so a candidate can never weaken the CI that gates it.
+# Pushes made with a workflow's GITHUB_TOKEN do not trigger new workflow runs,
+# but token-created workflow_dispatch events do.
 on:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Commit SHA to check out and validate. Empty means the dispatched ref's head."
+        type: string
+        default: ""
   push:
     branches:
       - main
+      - sync/main
 
 permissions:
   contents: read
@@ -16,12 +28,15 @@ concurrency:
 jobs:
   check:
     name: Check
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -75,12 +90,15 @@ jobs:
   # limit stays at the default 4 so peak load per runner is unchanged.
   test:
     name: Test
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -118,8 +136,8 @@ jobs:
   # isolation that flag buys is preserved exactly.
   test_server:
     name: Test Server ${{ matrix.shard }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -128,6 +146,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -185,12 +206,15 @@ jobs:
   # for checks that take under 3s, on the critical path of every PR.
   rust:
     name: Rust
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -219,8 +243,8 @@ jobs:
   # the diff cannot be resolved, the lint runs.
   mobile_native_changes:
     name: Mobile Native Changes
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
@@ -233,6 +257,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BEFORE_SHA: ${{ github.event.before }}
+          # On a trusted dispatch from sync-upstream the workflow runs from
+          # main, so GITHUB_SHA is main's head — use the dispatched candidate.
+          TARGET_SHA: ${{ inputs.candidate_sha || github.sha }}
         run: |
           set -uo pipefail
 
@@ -264,7 +291,16 @@ jobs:
               fail_open "GitHub listed only ${listed} of ${expected} changed files."
             fi
           else
-            rows=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${GITHUB_SHA}" --jq ".files[]? | ${row}") \
+            # push events carry `before`; workflow_dispatch does not (the
+            # upstream-sync workflow dispatches CI on its candidate), so fall
+            # back to the commit's first parent: for a merge candidate that is
+            # the fork main the candidate would land on, and the compare then
+            # covers exactly the change being introduced.
+            if [[ -z "${BEFORE_SHA}" ]]; then
+              BEFORE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}" --jq '.parents[0].sha') \
+                || fail_open "Could not resolve the commit's parent."
+            fi
+            rows=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${TARGET_SHA}" --jq ".files[]? | ${row}") \
               || fail_open "Could not resolve changed files."
 
             # The compare endpoint reports at most 300 files and pagination does
@@ -297,12 +333,15 @@ jobs:
     # Skip only on an explicit "no": a gate job that failed or errored leaves the
     # output empty, and that must run the lint rather than silently skip it.
     if: ${{ !cancelled() && needs.mobile_native_changes.outputs.changed != 'false' }}
-    runs-on: blacksmith-6vcpu-macos-26
-    timeout-minutes: 10
+    runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -325,12 +364,15 @@ jobs:
 
   release_smoke:
     name: Release Smoke
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
