@@ -11,8 +11,7 @@ on:
 
 permissions:
   contents: write # push sync/main and fast-forward main
-  actions: write # dispatch the CI workflow on the candidate
-  checks: read # poll check runs on the candidate SHA
+  actions: write # dispatch CI from trusted main and read the dispatched run
 
 concurrency:
   group: sync-upstream
@@ -61,6 +60,24 @@ jobs:
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Verify fork CI adaptations survived the merge
+        # Guards against an upstream change silently replacing this workflow's
+        # assumptions on the candidate: the sync workflow itself must still
+        # exist, and ci.yml must still accept the candidate_sha input that
+        # gates promotion on a trusted CI run. A conflict would already have
+        # aborted the merge above; this catches clean but hostile rewrites.
+        if: steps.status.outputs.up_to_date != 'true'
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/sync-upstream.yml || {
+            echo "::error::sync-upstream.yml vanished after the upstream merge; main was not touched."
+            exit 1
+          }
+          grep -q 'candidate_sha' .github/workflows/ci.yml || {
+            echo "::error::ci.yml no longer accepts the candidate_sha input; main was not touched."
+            exit 1
+          }
+
       - name: Push candidate
         if: steps.status.outputs.up_to_date != 'true'
         run: git push origin sync/main --force
@@ -68,50 +85,60 @@ jobs:
       - name: Start CI on the candidate
         # A push made with this workflow's GITHUB_TOKEN would not trigger new
         # workflow runs (GitHub blocks token-recursive triggers), so start CI
-        # explicitly. workflow_dispatch runs record their check runs on the
-        # branch head SHA, which the next step polls.
-        if: steps.status.outputs.up_to_date != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run ci.yml --ref sync/main
-
-      - name: Wait for CI to pass on the candidate
+        # explicitly. Dispatch from trusted main and pass the candidate SHA as
+        # an input: running ci.yml from the candidate ref would let a poisoned
+        # candidate weaken or disable the very CI that gates it.
+        # return_run_details makes the API return the created run so the next
+        # step can poll exactly this run instead of every check run on the SHA.
+        id: dispatch
         if: steps.status.outputs.up_to_date != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.candidate.outputs.sha }}
         run: |
           set -euo pipefail
+          response="$(gh api -X POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/dispatches?return_run_details=true" \
+            -f ref=main -F "inputs[candidate_sha]=${SHA}")"
+          echo "run_id=$(jq -r .workflow_run_id <<< "$response")" >> "$GITHUB_OUTPUT"
+          echo "run_url=$(jq -r .html_url <<< "$response")" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CI to pass on the candidate
+        if: steps.status.outputs.up_to_date != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ steps.dispatch.outputs.run_id }}
+          RUN_URL: ${{ steps.dispatch.outputs.run_url }}
+        run: |
+          set -euo pipefail
           deadline=$(( $(date +%s) + 90 * 60 ))
 
           while :; do
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::Timed out after 90 minutes waiting for CI on ${SHA}; main was not touched."
+              echo "::error::Timed out after 90 minutes waiting for ${RUN_URL}; main was not touched."
               exit 1
             fi
 
-            # One "conclusion<TAB>status" row per check run on the candidate.
-            # Conclusion is empty while the run is pending; an empty list
-            # means the dispatched run has not registered yet.
-            runs="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
-              --paginate --jq '.check_runs[] | [(.conclusion // ""), .status] | @tsv')"
+            # The dispatched run may take a few seconds to become visible;
+            # treat a lookup failure as "still running" rather than aborting.
+            status="$(gh run view "${RUN_ID}" --json status,conclusion --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
 
-            if [ -z "$runs" ]; then
-              echo "No check runs registered yet; retrying in 60s."
-            elif grep -v $'\tcompleted$' <<< "$runs" | grep -q .; then
-              echo "$(grep -c -v $'\tcompleted$' <<< "$runs") check run(s) still in progress; retrying in 60s."
-            elif grep -Eq $'^(failure|cancelled|timed_out|startup_failure)\t' <<< "$runs"; then
-              echo "::error::CI failed on sync candidate ${SHA}; main was not touched. Inspect the CI run on that commit and fix before the next sync."
-              exit 1
+            if [ -z "$status" ]; then
+              echo "Run not visible yet: ${RUN_URL}; retrying in 60s."
             else
-              bad="$(awk -F '\t' '$1 != "success" && $1 != "neutral" && $1 != "skipped"' <<< "$runs")"
-              if [ -n "$bad" ]; then
-                echo "::error::Unexpected check run conclusion on ${SHA}; main was not touched:"
-                echo "$bad"
-                exit 1
-              fi
-              echo "All check runs on ${SHA} passed."
-              exit 0
+              case "$status" in
+                completed$'\t'success)
+                  echo "CI passed: ${RUN_URL}"
+                  exit 0
+                  ;;
+                completed$'\t'*)
+                  echo "::error::CI did not pass (${status#*$'\t'}): ${RUN_URL}; main was not touched. Inspect the run and fix before the next sync."
+                  exit 1
+                  ;;
+                *)
+                  echo "CI still running (${status%%$'\t'*}): ${RUN_URL}; retrying in 60s."
+                  ;;
+              esac
             fi
 
             sleep 60

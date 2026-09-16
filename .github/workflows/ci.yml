@@ -1,11 +1,18 @@
 name: CI
 
-# workflow_dispatch lets the upstream-sync workflow start CI on its sync/main
-# candidate: pushes made with a workflow's GITHUB_TOKEN do not trigger new
-# workflow runs, but token-created workflow_dispatch events do.
+# workflow_dispatch lets the upstream-sync workflow test a sync candidate: it
+# dispatches this file *from trusted main* and passes the candidate SHA as the
+# candidate_sha input, so a candidate can never weaken the CI that gates it.
+# Pushes made with a workflow's GITHUB_TOKEN do not trigger new workflow runs,
+# but token-created workflow_dispatch events do.
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Commit SHA to check out and validate. Empty means the dispatched ref's head."
+        type: string
+        default: ""
   push:
     branches:
       - main
@@ -27,6 +34,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -86,6 +96,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -133,6 +146,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -196,6 +212,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -238,6 +257,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BEFORE_SHA: ${{ github.event.before }}
+          # On a trusted dispatch from sync-upstream the workflow runs from
+          # main, so GITHUB_SHA is main's head — use the dispatched candidate.
+          TARGET_SHA: ${{ inputs.candidate_sha || github.sha }}
         run: |
           set -uo pipefail
 
@@ -275,10 +297,10 @@ jobs:
             # the fork main the candidate would land on, and the compare then
             # covers exactly the change being introduced.
             if [[ -z "${BEFORE_SHA}" ]]; then
-              BEFORE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.parents[0].sha') \
+              BEFORE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}" --jq '.parents[0].sha') \
                 || fail_open "Could not resolve the commit's parent."
             fi
-            rows=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${GITHUB_SHA}" --jq ".files[]? | ${row}") \
+            rows=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${TARGET_SHA}" --jq ".files[]? | ${row}") \
               || fail_open "Could not resolve changed files."
 
             # The compare endpoint reports at most 300 files and pagination does
@@ -317,6 +339,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -345,6 +370,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          # Empty on non-dispatch events: checkout then resolves the event's
+          # own ref (PR merge commit, pushed branch head).
+          ref: ${{ inputs.candidate_sha }}
           sparse-checkout: |
             /*
             !/.repos/
