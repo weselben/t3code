@@ -269,6 +269,15 @@ jobs:
               fail_open "GitHub listed only ${listed} of ${expected} changed files."
             fi
           else
+            # push events carry `before`; workflow_dispatch does not (the
+            # upstream-sync workflow dispatches CI on its candidate), so fall
+            # back to the commit's first parent: for a merge candidate that is
+            # the fork main the candidate would land on, and the compare then
+            # covers exactly the change being introduced.
+            if [[ -z "${BEFORE_SHA}" ]]; then
+              BEFORE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.parents[0].sha') \
+                || fail_open "Could not resolve the commit's parent."
+            fi
             rows=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${GITHUB_SHA}" --jq ".files[]? | ${row}") \
               || fail_open "Could not resolve changed files."
 
