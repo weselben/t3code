@@ -822,7 +822,10 @@ const program = Effect.gen(function* () {
       }
 
       if (kimiProfile && emitKimiElicitationMode) {
-        const elicitRequestedSchema =
+        const elicitRequestedSchema: Extract<
+          AcpSchema.ElicitationRequest,
+          { mode: "form" }
+        >["requestedSchema"] =
           emitKimiElicitationMode === "boolean"
             ? {
                 type: "object",

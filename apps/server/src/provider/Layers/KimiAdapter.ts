@@ -373,9 +373,14 @@ function elicitationSchemaIssue(
         return `Answer for "${key}" must be a boolean.`;
       }
     } else {
-      return `Answer for "${key}" must match the requested schema type "${property.type}".`;
+      return `Answer for "${key}" has an unsupported schema type.`;
     }
-    if (allowed && property.type === "string" && !allowed.includes(value)) {
+    if (
+      allowed &&
+      property.type === "string" &&
+      typeof value === "string" &&
+      !allowed.includes(value)
+    ) {
       return `Answer for "${key}" must be one of: ${allowed.join(", ")}.`;
     }
   }
