@@ -17,6 +17,7 @@ const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const kimiProfile = process.env.T3_ACP_KIMI === "1";
 const emitKimiSubagentToolCalls = process.env.T3_ACP_KIMI_EMIT_SUBAGENT_TOOL_CALLS === "1";
+const emitKimiElicitation = process.env.T3_ACP_KIMI_EMIT_ELICIT === "1";
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
@@ -815,6 +816,42 @@ const program = Effect.gen(function* () {
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: "hello from kimi" },
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+
+      if (kimiProfile && emitKimiElicitation) {
+        const elicitResult = yield* agent.client.elicit({
+          mode: "form",
+          sessionId: requestedSessionId,
+          message: "Pick a color",
+          requestedSchema: {
+            type: "object",
+            title: "Color picker",
+            required: ["color"],
+            properties: {
+              color: {
+                type: "string",
+                title: "Color",
+                oneOf: [
+                  { const: "red", title: "Red" },
+                  { const: "blue", title: "Blue" },
+                ],
+              },
+            },
+          },
+        });
+        const elicitAction = elicitResult.action;
+        const chosen =
+          elicitAction.action === "accept" && elicitAction.content
+            ? String(elicitAction.content.color ?? "nothing")
+            : "nothing";
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `selected ${chosen}` },
           },
         });
         return { stopReason: "end_turn" };

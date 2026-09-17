@@ -12,12 +12,14 @@ import {
   type ProviderInteractionMode,
   type ProviderRuntimeEvent,
   type ProviderSession,
+  type ProviderUserInputAnswers,
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
   type RuntimeMode,
   type ThreadId,
   TurnId,
+  UserInputQuestion,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
@@ -112,6 +114,14 @@ interface PendingApproval {
   readonly kind: string | "unknown";
 }
 
+type PendingUserInputResolution =
+  | { readonly _tag: "answered"; readonly answers: ProviderUserInputAnswers }
+  | { readonly _tag: "cancelled" };
+
+interface PendingUserInput {
+  readonly resolution: Deferred.Deferred<PendingUserInputResolution>;
+}
+
 interface KimiSessionContext {
   readonly threadId: ThreadId;
   session: ProviderSession;
@@ -119,6 +129,7 @@ interface KimiSessionContext {
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
+  readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
@@ -136,6 +147,16 @@ function settlePendingApprovalsAsCancelled(
   return Effect.forEach(
     Array.from(pendingApprovals.values()),
     (pending) => Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore),
+    { discard: true },
+  );
+}
+
+function settlePendingUserInputsAsCancelled(
+  pendingUserInputs: ReadonlyMap<ApprovalRequestId, PendingUserInput>,
+): Effect.Effect<void> {
+  return Effect.forEach(
+    Array.from(pendingUserInputs.values()),
+    (pending) => Deferred.succeed(pending.resolution, { _tag: "cancelled" }).pipe(Effect.ignore),
     { discard: true },
   );
 }
@@ -210,6 +231,84 @@ function selectAutoApprovedPermissionOption(
   }
 
   return undefined;
+}
+
+/** Map a single ElicitationPropertySchema entry to T3 UserInputQuestionOption values. */
+function elicitationPropertyToOptions(
+  property: EffectAcpSchema.ElicitationPropertySchema,
+): ReadonlyArray<{ label: string; value?: string; description: string }> {
+  if (property.type === "string") {
+    if (property.oneOf && property.oneOf.length > 0) {
+      return property.oneOf.map((option) => ({
+        label: option.title.trim() || option.const,
+        value: option.const,
+        description: option.title,
+      }));
+    }
+    if (property.enum && property.enum.length > 0) {
+      return property.enum.map((value) => ({
+        label: value,
+        value,
+        description: value,
+      }));
+    }
+    return [];
+  }
+  if (property.type === "array") {
+    if ("enum" in property.items) {
+      return property.items.enum.map((value) => ({
+        label: value,
+        value,
+        description: value,
+      }));
+    }
+    return property.items.anyOf.map((option) => ({
+      label: option.title.trim() || option.const,
+      value: option.const,
+      description: option.title,
+    }));
+  }
+  return [];
+}
+
+/**
+ * Map an ACP form-mode elicitation schema into one UserInputQuestion per
+ * property. Best-effort: anything we cannot translate (e.g. numeric properties
+ * without a known UI surface) still becomes a question with an empty option
+ * list and `allowCustomAnswer: true`, so the user can free-form type.
+ */
+function mapElicitationFormToQuestions(
+  request: EffectAcpSchema.ElicitationRequest,
+): ReadonlyArray<UserInputQuestion> | undefined {
+  if (request.mode !== "form") return undefined;
+  const schema = request.requestedSchema;
+  const properties = schema.properties ?? {};
+  const required = new Set(schema.required ?? []);
+  const questions: Array<UserInputQuestion> = [];
+  for (const [propertyId, property] of Object.entries(properties)) {
+    const options = elicitationPropertyToOptions(property);
+    const isArray = property.type === "array";
+    const hasEnum = options.length > 0;
+    const allowCustomAnswer = !required.has(propertyId) || !hasEnum;
+    const header = (property.title?.trim() || schema.title?.trim() || "Question").slice(0, 120);
+    questions.push({
+      id: propertyId,
+      header,
+      question:
+        property.description?.trim() ||
+        property.title?.trim() ||
+        request.message ||
+        "Please answer.",
+      options: options.map((option) => ({
+        label: option.label,
+        description: option.description,
+        ...(option.value !== undefined ? { value: option.value } : {}),
+      })),
+      allowCustomAnswer,
+      multiSelect: isArray,
+    });
+  }
+  return questions;
 }
 
 /** Reclassify Kimi's `Agent` / `AgentSwarm` tool calls as subagent rows. */
@@ -395,6 +494,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
         if (ctx.stopped) return;
         ctx.stopped = true;
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
+        yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
@@ -437,6 +537,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
           }
 
           const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
+          const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
           const sessionScope = yield* Scope.make("sequential");
           let sessionScopeTransferred = false;
           yield* Effect.addFinalizer(() =>
@@ -576,6 +677,68 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                 }),
               ),
             );
+            yield* acp.handleElicitation((params) =>
+              mapExtensionFailure(
+                Effect.gen(function* () {
+                  yield* logNative(input.threadId, "session/elicitation", params);
+                  if (params.mode !== "form") {
+                    // URL-mode elicitation is not surfaced today; cancel so
+                    // the agent can decide whether to retry with a form or
+                    // fall back. `methodNotFound` was the prior behavior and
+                    // it wedged the agent indefinitely.
+                    return { action: { action: "cancel" as const } };
+                  }
+                  const questions = mapElicitationFormToQuestions(params);
+                  if (!questions || questions.length === 0) {
+                    return { action: { action: "cancel" as const } };
+                  }
+                  const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
+                  const runtimeRequestId = RuntimeRequestId.make(requestId);
+                  const resolution = yield* Deferred.make<PendingUserInputResolution>();
+                  pendingUserInputs.set(requestId, { resolution });
+                  yield* offerRuntimeEvent({
+                    type: "user-input.requested",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId: ctx?.activeTurnId,
+                    requestId: runtimeRequestId,
+                    payload: { questions: [...questions] },
+                    raw: {
+                      source: "acp.jsonrpc",
+                      method: "session/elicitation",
+                      payload: params,
+                    },
+                  });
+                  const resolved = yield* Deferred.await(resolution);
+                  pendingUserInputs.delete(requestId);
+                  const answers = resolved._tag === "answered" ? resolved.answers : {};
+                  yield* offerRuntimeEvent({
+                    type: "user-input.resolved",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId: ctx?.activeTurnId,
+                    requestId: runtimeRequestId,
+                    payload: { answers },
+                    raw: {
+                      source: "acp.jsonrpc",
+                      method: "session/elicitation",
+                      payload: params,
+                    },
+                  });
+                  if (resolved._tag === "answered") {
+                    return {
+                      action: {
+                        action: "accept" as const,
+                        content: answers as Record<string, EffectAcpSchema.ElicitationContentValue>,
+                      },
+                    };
+                  }
+                  return { action: { action: "cancel" as const } };
+                }),
+              ),
+            );
             return yield* acp.start();
           }).pipe(
             Effect.mapError((error) =>
@@ -618,6 +781,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             acp,
             notificationFiber: undefined,
             pendingApprovals,
+            pendingUserInputs,
             turns: [],
             lastPlanFingerprint: undefined,
             activeTurnId: undefined,
@@ -942,6 +1106,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
+        yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         yield* Effect.ignore(
           ctx.acp.cancel.pipe(
             Effect.mapError((error) =>
@@ -969,14 +1134,22 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
         yield* Deferred.succeed(pending.decision, decision);
       });
 
-    const respondToUserInput: KimiAdapterShape["respondToUserInput"] = (threadId) =>
+    const respondToUserInput: KimiAdapterShape["respondToUserInput"] = (
+      threadId,
+      requestId,
+      answers,
+    ) =>
       Effect.gen(function* () {
-        yield* requireSession(threadId);
-        return yield* new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "session/elicitation",
-          detail: "Kimi ACP sessions do not support structured user-input requests.",
-        });
+        const ctx = yield* requireSession(threadId);
+        const pending = ctx.pendingUserInputs.get(requestId);
+        if (!pending) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/elicitation",
+            detail: `Unknown pending user-input request: ${requestId}`,
+          });
+        }
+        yield* Deferred.succeed(pending.resolution, { _tag: "answered", answers });
       });
 
     const readThread: KimiAdapterShape["readThread"] = (threadId) =>

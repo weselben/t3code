@@ -69,6 +69,15 @@ export const makeKimiAcpRuntime = (
         ...input,
         spawn: buildKimiAcpSpawnInput(input.kimiSettings, input.cwd, input.environment),
         authMethodId: "login",
+        // Advertise form-mode elicitation so Kimi's ACP process sends
+        // `session/elicitation` requests to the client instead of bailing out
+        // with `methodNotFound`. The form capability is the only one Kimi
+        // 0.43.x exercises today; URL elicitation stays off.
+        clientCapabilities: {
+          elicitation: {
+            form: {},
+          },
+        },
       }).pipe(
         Layer.provide(
           Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, input.childProcessSpawner),
