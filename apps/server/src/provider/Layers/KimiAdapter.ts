@@ -778,7 +778,10 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                   const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                   const runtimeRequestId = RuntimeRequestId.make(requestId);
                   const resolution = yield* Deferred.make<PendingUserInputResolution>();
-                  pendingUserInputs.set(requestId, { resolution, requestedSchema: params.requestedSchema });
+                  pendingUserInputs.set(requestId, {
+                    resolution,
+                    requestedSchema: params.requestedSchema,
+                  });
                   yield* offerRuntimeEvent({
                     type: "user-input.requested",
                     ...(yield* makeEventStamp()),

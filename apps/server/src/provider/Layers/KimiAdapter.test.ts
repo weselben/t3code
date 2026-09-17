@@ -570,9 +570,7 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
       const requestedEvent = yield* Deferred.await(requested);
       const requestId = ApprovalRequestId.make(String(requestedEvent.requestId));
 
-      const missing = yield* adapter
-        .respondToUserInput(threadId, requestId, {})
-        .pipe(Effect.flip);
+      const missing = yield* adapter.respondToUserInput(threadId, requestId, {}).pipe(Effect.flip);
       assert.equal(missing._tag, "ProviderAdapterValidationError");
       if (missing._tag === "ProviderAdapterValidationError") {
         assert.match(missing.issue, /Missing required answer for "color"/);
