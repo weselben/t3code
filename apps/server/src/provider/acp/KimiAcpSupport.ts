@@ -39,7 +39,7 @@ interface KimiAcpRuntimeInput extends Omit<
 }
 
 /** Builds the child-process command for Kimi's ACP server. */
-export function buildKimiAcpSpawnInput(
+function buildKimiAcpSpawnInput(
   kimiSettings: KimiAcpRuntimeKimiSettings | null | undefined,
   cwd: string,
   environment?: NodeJS.ProcessEnv,
@@ -93,7 +93,7 @@ export const makeKimiAcpRuntime = (
  * Resolves the Kimi data directory from `KIMI_CODE_HOME`, falling back to
  * `~/.kimi-code`. The returned path is never read — callers only join it.
  */
-export function resolveKimiDataHome(environment: NodeJS.ProcessEnv | undefined): string {
+function resolveKimiDataHome(environment: NodeJS.ProcessEnv | undefined): string {
   const override = environment?.[KIMI_HOME_ENV]?.trim();
   return override ? override : NodePath.join(NodeOS.homedir(), ".kimi-code");
 }
