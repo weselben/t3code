@@ -17,7 +17,7 @@ const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const kimiProfile = process.env.T3_ACP_KIMI === "1";
 const emitKimiSubagentToolCalls = process.env.T3_ACP_KIMI_EMIT_SUBAGENT_TOOL_CALLS === "1";
-const emitKimiElicitation = process.env.T3_ACP_KIMI_EMIT_ELICIT === "1";
+const emitKimiElicitationMode = process.env.T3_ACP_KIMI_EMIT_ELICIT;
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
@@ -821,32 +821,67 @@ const program = Effect.gen(function* () {
         return { stopReason: "end_turn" };
       }
 
-      if (kimiProfile && emitKimiElicitation) {
+      if (kimiProfile && emitKimiElicitationMode) {
+        const elicitRequestedSchema =
+          emitKimiElicitationMode === "boolean"
+            ? {
+                type: "object",
+                title: "Confirm",
+                required: ["agree"],
+                properties: {
+                  agree: {
+                    type: "boolean",
+                    title: "Agree",
+                  },
+                },
+              }
+            : emitKimiElicitationMode === "free-form-string"
+              ? {
+                  type: "object",
+                  title: "Note",
+                  required: ["note"],
+                  properties: {
+                    note: {
+                      type: "string",
+                      title: "Note",
+                    },
+                  },
+                }
+              : {
+                  type: "object",
+                  title: "Color picker",
+                  required: ["color"],
+                  properties: {
+                    color: {
+                      type: "string",
+                      title: "Color",
+                      oneOf: [
+                        { const: "red", title: "Red" },
+                        { const: "blue", title: "Blue" },
+                      ],
+                    },
+                  },
+                };
         const elicitResult = yield* agent.client.elicit({
           mode: "form",
           sessionId: requestedSessionId,
-          message: "Pick a color",
-          requestedSchema: {
-            type: "object",
-            title: "Color picker",
-            required: ["color"],
-            properties: {
-              color: {
-                type: "string",
-                title: "Color",
-                oneOf: [
-                  { const: "red", title: "Red" },
-                  { const: "blue", title: "Blue" },
-                ],
-              },
-            },
-          },
+          message:
+            emitKimiElicitationMode === "boolean"
+              ? "Please confirm"
+              : emitKimiElicitationMode === "free-form-string"
+                ? "Please leave a note"
+                : "Pick a color",
+          requestedSchema: elicitRequestedSchema,
         });
         const elicitAction = elicitResult.action;
-        const chosen =
-          elicitAction.action === "accept" && elicitAction.content
-            ? String(elicitAction.content.color ?? "nothing")
-            : "nothing";
+        const chosenContent = elicitAction.action === "accept" ? elicitAction.content : undefined;
+        const chosen = chosenContent
+          ? emitKimiElicitationMode === "boolean"
+            ? String(chosenContent.agree ?? "nothing")
+            : emitKimiElicitationMode === "free-form-string"
+              ? String(chosenContent.note ?? "nothing")
+              : String(chosenContent.color ?? "nothing")
+          : "nothing";
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,
           update: {

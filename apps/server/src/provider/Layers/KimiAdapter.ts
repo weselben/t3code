@@ -157,11 +157,17 @@ interface KimiSessionContext {
 }
 
 function settlePendingApprovalsAsCancelled(
-  pendingApprovals: ReadonlyMap<ApprovalRequestId, PendingApproval>,
+  pendingApprovals: Map<ApprovalRequestId, PendingApproval>,
 ): Effect.Effect<void> {
   return Effect.forEach(
-    Array.from(pendingApprovals.values()),
-    (pending) => Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore),
+    Array.from(pendingApprovals.entries()),
+    ([requestId, pending]) =>
+      Effect.gen(function* () {
+        // Consume the entry while settling so a late response is rejected as
+        // unknown instead of resolving an already-settled deferred.
+        pendingApprovals.delete(requestId);
+        yield* Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore);
+      }),
     { discard: true },
   );
 }
@@ -319,10 +325,11 @@ function allowedElicitationValues(
 }
 
 /**
- * Validate answered content against the elicitation form schema. Only
- * enum-shaped constraints are enforced: required properties must be
- * present, and string answers (or array elements) must be members of the
- * property's declared options. Returns the first issue found, if any.
+ * Validate answered content against the elicitation form schema. The schema
+ * is enforced property-by-property: unknown keys are rejected, every declared
+ * property's `type` is checked before any enum/oneOf membership, and string or
+ * array constraints (enum / oneOf) apply only after the type check passes.
+ * Unconstrained properties of the matching type are accepted (free-form).
  */
 function elicitationSchemaIssue(
   schema: FormElicitationRequest["requestedSchema"],
@@ -336,18 +343,39 @@ function elicitationSchemaIssue(
   const properties = schema.properties ?? {};
   for (const [key, value] of Object.entries(content)) {
     const property = properties[key];
-    const allowed = property ? allowedElicitationValues(property) : undefined;
-    if (!allowed) continue;
-    if (property?.type === "array") {
+    if (!property) {
+      return `Answer for "${key}" is not declared by the requested schema.`;
+    }
+    const allowed = allowedElicitationValues(property);
+    if (property.type === "array") {
       if (!Array.isArray(value)) {
         return `Answer for "${key}" must be an array of strings.`;
       }
-      if (value.some((element) => !allowed.includes(element))) {
+      if (allowed && value.some((element) => !allowed.includes(element))) {
         return `Answer for "${key}" must only use: ${allowed.join(", ")}.`;
       }
       continue;
     }
-    if (typeof value !== "string" || !allowed.includes(value)) {
+    if (property.type === "string") {
+      if (typeof value !== "string") {
+        return `Answer for "${key}" must be a string.`;
+      }
+    } else if (property.type === "number") {
+      if (typeof value !== "number") {
+        return `Answer for "${key}" must be a number.`;
+      }
+    } else if (property.type === "integer") {
+      if (typeof value !== "number" || !Number.isInteger(value)) {
+        return `Answer for "${key}" must be an integer.`;
+      }
+    } else if (property.type === "boolean") {
+      if (typeof value !== "boolean") {
+        return `Answer for "${key}" must be a boolean.`;
+      }
+    } else {
+      return `Answer for "${key}" must match the requested schema type "${property.type}".`;
+    }
+    if (allowed && property.type === "string" && !allowed.includes(value)) {
       return `Answer for "${key}" must be one of: ${allowed.join(", ")}.`;
     }
   }
@@ -736,7 +764,6 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     }),
                   );
                   const resolved = yield* Deferred.await(decision);
-                  pendingApprovals.delete(requestId);
                   yield* offerRuntimeEvent(
                     makeAcpRequestResolvedEvent({
                       stamp: yield* makeEventStamp(),
@@ -1216,6 +1243,9 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             detail: `Unknown pending approval request: ${requestId}`,
           });
         }
+        // Consume the entry before settling so a duplicate response is
+        // rejected as unknown instead of no-op'ing on a settled deferred.
+        ctx.pendingApprovals.delete(requestId);
         yield* Deferred.succeed(pending.decision, decision);
       });
 
