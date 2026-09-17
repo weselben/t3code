@@ -78,6 +78,7 @@ const KIMI_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
   },
 ];
 
+/** Creates the settings-derived snapshot used before any Kimi CLI probe runs. */
 export function buildInitialKimiProviderSnapshot(
   kimiSettings: KimiSettings,
 ): Effect.Effect<ServerProviderDraft> {
@@ -141,6 +142,10 @@ const runKimiCliCommand = (
     );
   });
 
+/**
+ * Probes Kimi's version and login-file presence, representing probe failures
+ * in the returned provider snapshot without reading the credential file.
+ */
 export const checkKimiProviderStatus = Effect.fn("checkKimiProviderStatus")(function* (
   kimiSettings: KimiSettings,
   environment: NodeJS.ProcessEnv = process.env,
@@ -280,6 +285,7 @@ export const checkKimiProviderStatus = Effect.fn("checkKimiProviderStatus")(func
   });
 });
 
+/** Publishes version-advisory metadata, logging and suppressing enrichment failures. */
 export const enrichKimiSnapshot = (input: {
   readonly snapshot: ServerProvider;
   readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;

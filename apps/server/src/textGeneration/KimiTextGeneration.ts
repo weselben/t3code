@@ -34,6 +34,11 @@ const KIMI_TIMEOUT_MS = 180_000;
 
 const isTextGenerationError = Schema.is(TextGenerationError);
 
+/**
+ * Builds Kimi-backed generation for commit messages, pull requests, branch
+ * names, and thread titles, mapping ACP and structured-output failures to
+ * `TextGenerationError`.
+ */
 export const makeKimiTextGeneration = Effect.fn("makeKimiTextGeneration")(function* (
   kimiSettings: KimiSettings,
   environment: NodeJS.ProcessEnv = process.env,

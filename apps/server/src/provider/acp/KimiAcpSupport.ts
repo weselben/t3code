@@ -38,6 +38,7 @@ interface KimiAcpRuntimeInput extends Omit<
   readonly runtimeMode?: RuntimeMode;
 }
 
+/** Builds the child-process command for Kimi's ACP server. */
 export function buildKimiAcpSpawnInput(
   kimiSettings: KimiAcpRuntimeKimiSettings | null | undefined,
   cwd: string,
@@ -51,6 +52,10 @@ export function buildKimiAcpSpawnInput(
   };
 }
 
+/**
+ * Spawns a scoped Kimi ACP runtime using the CLI's terminal login method.
+ * Closing the required scope also owns cleanup of the child process.
+ */
 export const makeKimiAcpRuntime = (
   input: KimiAcpRuntimeInput,
 ): Effect.Effect<
@@ -92,6 +97,7 @@ export function resolveKimiCredentialsPath(environment: NodeJS.ProcessEnv | unde
   return NodePath.join(resolveKimiDataHome(environment), ...KIMI_CREDENTIALS_RELATIVE_PATH);
 }
 
+/** Normalizes a model selection, using Kimi's default for missing or blank values. */
 export function resolveKimiAcpBaseModelId(model: string | null | undefined): string {
   const trimmed = model?.trim();
   const base = trimmed && trimmed.length > 0 ? trimmed : KIMI_DEFAULT_MODEL_SLUG;
@@ -202,6 +208,10 @@ export function resolveRequestedKimiModeId(input: {
   }
 }
 
+/**
+ * Selects a nonblank model only when it differs from the session's current
+ * model, returning the model id in effect after the operation.
+ */
 export function applyKimiAcpModelSelection<E>(input: {
   readonly runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "setSessionModel">;
   readonly currentModelId: string | undefined;

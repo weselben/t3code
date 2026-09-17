@@ -250,6 +250,10 @@ function makeKimiToolCallEvent(input: {
   };
 }
 
+/**
+ * Builds a scoped, per-instance Kimi adapter that translates ACP sessions and
+ * notifications into T3 provider operations and runtime events.
+ */
 export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapterLiveOptions) {
   return Effect.gen(function* () {
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("kimi");
