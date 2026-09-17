@@ -794,6 +794,82 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
       }),
   );
 
+  it.effect(
+    "disables custom answers for optional enum properties on the user-input.requested question",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* KimiAdapter;
+        const settings = yield* ServerSettingsService;
+        const threadId = ThreadId.make("kimi-elicitation-optional-enum-thread");
+
+        const wrapperPath = yield* Effect.promise(() =>
+          makeMockAgentWrapper({ T3_ACP_KIMI_EMIT_ELICIT: "optional-color" }),
+        );
+        yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+        const requested =
+          yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
+        const resolved =
+          yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }>>();
+        const completed =
+          yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+
+        const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+          if (String(event.threadId) !== String(threadId)) {
+            return Effect.void;
+          }
+          if (event.type === "user-input.requested") {
+            return Deferred.succeed(requested, event).pipe(Effect.ignore);
+          }
+          if (event.type === "user-input.resolved") {
+            return Deferred.succeed(resolved, event).pipe(Effect.ignore);
+          }
+          if (event.type === "turn.completed") {
+            return Deferred.succeed(completed, event).pipe(Effect.ignore);
+          }
+          return Effect.void;
+        }).pipe(Effect.forkChild);
+
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("kimi"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        });
+
+        const sendTurnFiber = yield* adapter
+          .sendTurn({ threadId, input: "ask me a question", attachments: [] })
+          .pipe(Effect.forkChild);
+
+        const requestedEvent = yield* Deferred.await(requested);
+        const question = requestedEvent.payload.questions[0];
+        assert.ok(question, "expected a question for the optional enum property");
+        assert.equal(question.id, "color");
+        assert.deepEqual(
+          question.options.map((option) => option.value),
+          ["red", "blue"],
+        );
+        // Even though `color` is optional, the server-side validator rejects
+        // any non-enum value, so the UI must not offer a free-form escape
+        // hatch.
+        assert.equal(question.allowCustomAnswer, false);
+
+        yield* adapter.respondToUserInput(
+          threadId,
+          ApprovalRequestId.make(String(requestedEvent.requestId)),
+          { color: "red" },
+        );
+
+        const resolvedEvent = yield* Deferred.await(resolved);
+        assert.deepEqual(resolvedEvent.payload.answers, { color: "red" });
+        yield* Fiber.join(sendTurnFiber);
+        yield* Deferred.await(completed);
+
+        yield* Fiber.interrupt(eventsFiber);
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
   it.effect("rejects a duplicate approval response after the first answer", () =>
     Effect.gen(function* () {
       const adapter = yield* KimiAdapter;

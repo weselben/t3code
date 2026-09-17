@@ -399,13 +399,15 @@ function mapElicitationFormToQuestions(
   if (request.mode !== "form") return undefined;
   const schema = request.requestedSchema;
   const properties = schema.properties ?? {};
-  const required = new Set(schema.required ?? []);
   const questions: Array<UserInputQuestion> = [];
   for (const [propertyId, property] of Object.entries(properties)) {
     const options = elicitationPropertyToOptions(property);
     const isArray = property.type === "array";
     const hasEnum = options.length > 0;
-    const allowCustomAnswer = !required.has(propertyId) || !hasEnum;
+    // Enum/oneOf properties are validated strictly on the server, so the UI
+    // must not offer a free-form escape hatch; only properties without a
+    // known option list allow a custom answer.
+    const allowCustomAnswer = !hasEnum;
     const header = (property.title?.trim() || schema.title?.trim() || "Question").slice(0, 120);
     questions.push({
       id: propertyId,
@@ -1040,15 +1042,22 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
     const sendTurn: KimiAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
-        // A sendTurn while a prompt is in flight is a steer: the agent folds
-        // the new prompt into the ongoing work, so the active turn id is
-        // reused instead of opening a new turn.
+        // Admission runs synchronously before any async setup so a concurrent
+        // sendTurn observes this turn through `activeTurnId`, not just the
+        // pre-claim `promptsInFlight` count. Without claiming the active turn
+        // here, a concurrent sendTurn would compute `steeringTurnId ===
+        // undefined`, allocate its own turn id, and duplicate the
+        // `turn.started` event before this fiber finishes setup.
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
         const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
-        // Count this prompt immediately so a superseded in-flight prompt
-        // resolving from here on does not settle the turn; the matching
-        // decrement is the `ensuring` below.
+        // Count this prompt and claim the active turn before any async step
+        // so the matching decrement (in `ensuring` below) leaves the counter
+        // and active-turn state coherent.
         ctx.promptsInFlight += 1;
+        ctx.activeTurnId = turnId;
+        if (steeringTurnId === undefined) {
+          ctx.lastPlanFingerprint = undefined;
+        }
 
         return yield* Effect.gen(function* () {
           const turnModelSelection =
@@ -1079,10 +1088,6 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
               );
           }
 
-          ctx.activeTurnId = turnId;
-          if (steeringTurnId === undefined) {
-            ctx.lastPlanFingerprint = undefined;
-          }
           ctx.session = {
             ...ctx.session,
             activeTurnId: turnId,
