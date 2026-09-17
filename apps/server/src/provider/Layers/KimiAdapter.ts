@@ -126,8 +126,15 @@ type PendingUserInputResolution =
     }
   | { readonly _tag: "cancelled" };
 
+/** The form-mode variant of an ACP elicitation request; the URL variant
+ * never reaches the user-input flow. */
+type FormElicitationRequest = Extract<EffectAcpSchema.ElicitationRequest, { mode: "form" }>;
+
 interface PendingUserInput {
   readonly resolution: Deferred.Deferred<PendingUserInputResolution>;
+  /** Form schema from the registered request; answers are validated
+   * against it before the entry is consumed. */
+  readonly requestedSchema: FormElicitationRequest["requestedSchema"];
 }
 
 interface KimiSessionContext {
@@ -283,6 +290,68 @@ function elicitationPropertyToOptions(
     }));
   }
   return [];
+}
+
+/** Enum-shaped allowed values for an elicitation property, mirroring how
+ * `elicitationPropertyToOptions` reads the schema. Properties without
+ * declared options return undefined and stay free-form. */
+function allowedElicitationValues(
+  property: EffectAcpSchema.ElicitationPropertySchema,
+): ReadonlyArray<string> | undefined {
+  if (property.type === "string") {
+    if (property.oneOf && property.oneOf.length > 0) {
+      return property.oneOf.map((option) => option.const);
+    }
+    if (property.enum && property.enum.length > 0) {
+      return property.enum;
+    }
+    return undefined;
+  }
+  if (property.type === "array") {
+    if ("enum" in property.items) {
+      return property.items.enum;
+    }
+    if (property.items.anyOf.length > 0) {
+      return property.items.anyOf.map((option) => option.const);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Validate answered content against the elicitation form schema. Only
+ * enum-shaped constraints are enforced: required properties must be
+ * present, and string answers (or array elements) must be members of the
+ * property's declared options. Returns the first issue found, if any.
+ */
+function elicitationSchemaIssue(
+  schema: FormElicitationRequest["requestedSchema"],
+  content: Record<string, EffectAcpSchema.ElicitationContentValue>,
+): string | undefined {
+  for (const name of schema.required ?? []) {
+    if (content[name] === undefined) {
+      return `Missing required answer for "${name}".`;
+    }
+  }
+  const properties = schema.properties ?? {};
+  for (const [key, value] of Object.entries(content)) {
+    const property = properties[key];
+    const allowed = property ? allowedElicitationValues(property) : undefined;
+    if (!allowed) continue;
+    if (property?.type === "array") {
+      if (!Array.isArray(value)) {
+        return `Answer for "${key}" must be an array of strings.`;
+      }
+      if (value.some((element) => !allowed.includes(element))) {
+        return `Answer for "${key}" must only use: ${allowed.join(", ")}.`;
+      }
+      continue;
+    }
+    if (typeof value !== "string" || !allowed.includes(value)) {
+      return `Answer for "${key}" must be one of: ${allowed.join(", ")}.`;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -709,7 +778,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                   const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                   const runtimeRequestId = RuntimeRequestId.make(requestId);
                   const resolution = yield* Deferred.make<PendingUserInputResolution>();
-                  pendingUserInputs.set(requestId, { resolution });
+                  pendingUserInputs.set(requestId, { resolution, requestedSchema: params.requestedSchema });
                   yield* offerRuntimeEvent({
                     type: "user-input.requested",
                     ...(yield* makeEventStamp()),
@@ -1172,6 +1241,16 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             });
           }
           content[key] = value;
+        }
+        const issue = elicitationSchemaIssue(pending.requestedSchema, content);
+        if (issue) {
+          // Leave the entry in place so the request stays pending and the
+          // user can retry with corrected answers.
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "respondToUserInput",
+            issue,
+          });
         }
         // Consume the entry before settling so a duplicate response is
         // rejected as unknown instead of no-op'ing on a settled deferred.
