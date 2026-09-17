@@ -393,4 +393,132 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
       yield* adapter.stopSession(threadId);
     }),
   );
+
+  it.effect("rejects a duplicate user-input response after the first answer", () =>
+    Effect.gen(function* () {
+      const adapter = yield* KimiAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("kimi-elicitation-duplicate-thread");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_KIMI_EMIT_ELICIT: "1" }),
+      );
+      yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+      const requested =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
+      const completed =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (String(event.threadId) !== String(threadId)) {
+          return Effect.void;
+        }
+        if (event.type === "user-input.requested") {
+          return Deferred.succeed(requested, event).pipe(Effect.ignore);
+        }
+        if (event.type === "turn.completed") {
+          return Deferred.succeed(completed, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "ask me a question", attachments: [] })
+        .pipe(Effect.forkChild);
+
+      const requestedEvent = yield* Deferred.await(requested);
+      const requestId = ApprovalRequestId.make(String(requestedEvent.requestId));
+
+      yield* adapter.respondToUserInput(threadId, requestId, { color: "red" });
+      const duplicate = yield* adapter
+        .respondToUserInput(threadId, requestId, { color: "blue" })
+        .pipe(Effect.flip);
+      assert.equal(duplicate._tag, "ProviderAdapterRequestError");
+      if (duplicate._tag === "ProviderAdapterRequestError") {
+        assert.match(duplicate.detail, /Unknown pending user-input request/);
+      }
+
+      yield* Fiber.join(sendTurnFiber);
+      yield* Deferred.await(completed);
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects invalid user-input answers and keeps the request pending", () =>
+    Effect.gen(function* () {
+      const adapter = yield* KimiAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("kimi-elicitation-invalid-thread");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_KIMI_EMIT_ELICIT: "1" }),
+      );
+      yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+      const requested =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
+      const resolved =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }>>();
+      const completed =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (String(event.threadId) !== String(threadId)) {
+          return Effect.void;
+        }
+        if (event.type === "user-input.requested") {
+          return Deferred.succeed(requested, event).pipe(Effect.ignore);
+        }
+        if (event.type === "user-input.resolved") {
+          return Deferred.succeed(resolved, event).pipe(Effect.ignore);
+        }
+        if (event.type === "turn.completed") {
+          return Deferred.succeed(completed, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "ask me a question", attachments: [] })
+        .pipe(Effect.forkChild);
+
+      const requestedEvent = yield* Deferred.await(requested);
+      const requestId = ApprovalRequestId.make(String(requestedEvent.requestId));
+
+      const invalid = yield* adapter
+        .respondToUserInput(threadId, requestId, { color: { shade: "dark" } })
+        .pipe(Effect.flip);
+      assert.equal(invalid._tag, "ProviderAdapterValidationError");
+      if (invalid._tag === "ProviderAdapterValidationError") {
+        assert.match(invalid.issue, /must be a string, number, boolean, or array of strings/);
+      }
+
+      // The request is still pending, so a valid answer resolves the turn.
+      yield* adapter.respondToUserInput(threadId, requestId, { color: "red" });
+      const resolvedEvent = yield* Deferred.await(resolved);
+      assert.deepEqual(resolvedEvent.payload.answers, { color: "red" });
+      yield* Fiber.join(sendTurnFiber);
+      yield* Deferred.await(completed);
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
 });

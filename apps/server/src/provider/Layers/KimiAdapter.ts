@@ -38,7 +38,7 @@ import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
-import type * as EffectAcpSchema from "effect-acp/schema";
+import * as EffectAcpSchema from "effect-acp/schema";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -82,6 +82,10 @@ function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
   return Exit.isSuccess(result) ? result.value : undefined;
 }
 
+/** ACP elicitation responses only encode these content values; anything
+ * else would abort the turn at response-encoding time. */
+const isElicitationContentValue = Schema.is(EffectAcpSchema.ElicitationContentValue);
+
 export interface KimiAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly nativeEventLogPath?: string;
@@ -115,7 +119,11 @@ interface PendingApproval {
 }
 
 type PendingUserInputResolution =
-  | { readonly _tag: "answered"; readonly answers: ProviderUserInputAnswers }
+  | {
+      readonly _tag: "answered";
+      /** Answers validated as ACP-encodable elicitation content. */
+      readonly answers: Record<string, EffectAcpSchema.ElicitationContentValue>;
+    }
   | { readonly _tag: "cancelled" };
 
 interface PendingUserInput {
@@ -152,11 +160,17 @@ function settlePendingApprovalsAsCancelled(
 }
 
 function settlePendingUserInputsAsCancelled(
-  pendingUserInputs: ReadonlyMap<ApprovalRequestId, PendingUserInput>,
+  pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>,
 ): Effect.Effect<void> {
   return Effect.forEach(
-    Array.from(pendingUserInputs.values()),
-    (pending) => Deferred.succeed(pending.resolution, { _tag: "cancelled" }).pipe(Effect.ignore),
+    Array.from(pendingUserInputs.entries()),
+    ([requestId, pending]) =>
+      Effect.gen(function* () {
+        // Consume the entry while settling so a late response is rejected as
+        // unknown instead of resolving an already-settled deferred.
+        pendingUserInputs.delete(requestId);
+        yield* Deferred.succeed(pending.resolution, { _tag: "cancelled" }).pipe(Effect.ignore);
+      }),
     { discard: true },
   );
 }
@@ -711,7 +725,6 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     },
                   });
                   const resolved = yield* Deferred.await(resolution);
-                  pendingUserInputs.delete(requestId);
                   const answers = resolved._tag === "answered" ? resolved.answers : {};
                   yield* offerRuntimeEvent({
                     type: "user-input.resolved",
@@ -731,7 +744,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     return {
                       action: {
                         action: "accept" as const,
-                        content: answers as Record<string, EffectAcpSchema.ElicitationContentValue>,
+                        content: answers,
                       },
                     };
                   }
@@ -1149,7 +1162,21 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             detail: `Unknown pending user-input request: ${requestId}`,
           });
         }
-        yield* Deferred.succeed(pending.resolution, { _tag: "answered", answers });
+        const content: Record<string, EffectAcpSchema.ElicitationContentValue> = {};
+        for (const [key, value] of Object.entries(answers)) {
+          if (!isElicitationContentValue(value)) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "respondToUserInput",
+              issue: `Answer for "${key}" must be a string, number, boolean, or array of strings.`,
+            });
+          }
+          content[key] = value;
+        }
+        // Consume the entry before settling so a duplicate response is
+        // rejected as unknown instead of no-op'ing on a settled deferred.
+        ctx.pendingUserInputs.delete(requestId);
+        yield* Deferred.succeed(pending.resolution, { _tag: "answered", answers: content });
       });
 
     const readThread: KimiAdapterShape["readThread"] = (threadId) =>
