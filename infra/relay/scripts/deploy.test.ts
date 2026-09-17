@@ -3,8 +3,8 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import * as NodeFS from "node:fs";
+import * as NodeURL from "node:url";
 
 import {
   hasDeployChanges,
@@ -183,8 +183,8 @@ describe("serializeRelayClientTracingEnvironment", () => {
 
 // The workflow assertions only apply where the upstream release workflow
 // exists; this fork's adapted CI set drops release.yml.
-const releaseWorkflowExists = existsSync(
-  fileURLToPath(new URL("../../../.github/workflows/release.yml", import.meta.url)),
+const releaseWorkflowExists = NodeFS.existsSync(
+  NodeURL.fileURLToPath(new URL("../../../.github/workflows/release.yml", import.meta.url)),
 );
 
 describe.skipIf(!releaseWorkflowExists)("release workflow tracing config propagation", () => {
