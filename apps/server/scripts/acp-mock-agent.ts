@@ -850,21 +850,36 @@ const program = Effect.gen(function* () {
                     },
                   },
                 }
-              : {
-                  type: "object",
-                  title: "Color picker",
-                  required: ["color"],
-                  properties: {
-                    color: {
-                      type: "string",
-                      title: "Color",
-                      oneOf: [
-                        { const: "red", title: "Red" },
-                        { const: "blue", title: "Blue" },
-                      ],
+              : emitKimiElicitationMode === "optional-color"
+                ? {
+                    type: "object",
+                    title: "Optional color picker",
+                    properties: {
+                      color: {
+                        type: "string",
+                        title: "Color",
+                        oneOf: [
+                          { const: "red", title: "Red" },
+                          { const: "blue", title: "Blue" },
+                        ],
+                      },
                     },
-                  },
-                };
+                  }
+                : {
+                    type: "object",
+                    title: "Color picker",
+                    required: ["color"],
+                    properties: {
+                      color: {
+                        type: "string",
+                        title: "Color",
+                        oneOf: [
+                          { const: "red", title: "Red" },
+                          { const: "blue", title: "Blue" },
+                        ],
+                      },
+                    },
+                  };
         const elicitResult = yield* agent.client.elicit({
           mode: "form",
           sessionId: requestedSessionId,
