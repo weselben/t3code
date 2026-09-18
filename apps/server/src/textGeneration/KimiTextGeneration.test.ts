@@ -135,6 +135,29 @@ it.layer(KimiTextGenerationTestLayer)("KimiTextGeneration", (it) => {
     ),
   );
 
+  it.effect("cancels a mid-prompt elicitation instead of hanging", () =>
+    withFakeAcpKimi(
+      {
+        T3_ACP_KIMI_EMIT_ELICIT: "free-form-string",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(
+            textGeneration.generateThreadTitle({
+              cwd: process.cwd(),
+              message: "anything",
+              modelSelection: createModelSelection(
+                ProviderInstanceId.make("kimi"),
+                "kimi-code/kimi-for-coding",
+              ),
+            }),
+          );
+          expect(error._tag).toBe("TextGenerationError");
+          expect(error.detail).toMatch(/invalid structured output/i);
+        }),
+    ),
+  );
+
   it.effect("fails with TextGenerationError when output is empty", () =>
     withFakeAcpKimi(
       {

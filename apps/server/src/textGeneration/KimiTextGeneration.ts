@@ -73,6 +73,16 @@ export const makeKimiTextGeneration = Effect.fn("makeKimiTextGeneration")(functi
         clientInfo: { name: "t3-code-git-text", version: "0.0.0" },
       }).pipe(Effect.provideService(Crypto.Crypto, crypto));
 
+      // Headless generation has no UI to answer an elicitation or approve a
+      // permission request mid-turn; cancel both so Kimi fails fast instead
+      // of hanging on methodNotFound until the timeout.
+      yield* runtime.handleElicitation(() =>
+        Effect.succeed({ action: { action: "cancel" as const } }),
+      );
+      yield* runtime.handleRequestPermission(() =>
+        Effect.succeed({ outcome: { outcome: "cancelled" as const } }),
+      );
+
       yield* runtime.handleSessionUpdate((notification) => {
         const update = notification.update;
         if (update.sessionUpdate !== "agent_message_chunk") {

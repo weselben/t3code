@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as NodeOS from "node:os";
 
 import {
   classifyKimiSubagentLabel,
@@ -31,6 +32,26 @@ describe("resolveKimiCredentialsPath", () => {
     const path = resolveKimiCredentialsPath({});
     expect(path).toContain(".kimi-code");
     expect(path.endsWith("credentials/kimi-code.json")).toBe(true);
+  });
+
+  it("expands a leading ~/ in KIMI_CODE_HOME against the real home", () => {
+    const home = NodeOS.homedir();
+    expect(resolveKimiCredentialsPath({ KIMI_CODE_HOME: "~/.kimi-code" })).toBe(
+      `${home}/.kimi-code/credentials/kimi-code.json`,
+    );
+    expect(resolveKimiCredentialsPath({ KIMI_CODE_HOME: "~" })).toBe(
+      `${home}/credentials/kimi-code.json`,
+    );
+  });
+
+  it("keeps non-tilde overrides verbatim", () => {
+    expect(resolveKimiCredentialsPath({ KIMI_CODE_HOME: "/data/kimi" })).toBe(
+      "/data/kimi/credentials/kimi-code.json",
+    );
+    // A ~ not at the start is an ordinary directory name, not a home alias.
+    expect(resolveKimiCredentialsPath({ KIMI_CODE_HOME: "/srv/~/kimi" })).toBe(
+      "/srv/~/kimi/credentials/kimi-code.json",
+    );
   });
 });
 

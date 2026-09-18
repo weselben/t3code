@@ -91,11 +91,22 @@ export const makeKimiAcpRuntime = (
 
 /**
  * Resolves the Kimi data directory from `KIMI_CODE_HOME`, falling back to
- * `~/.kimi-code`. The returned path is never read — callers only join it.
+ * `~/.kimi-code`. A leading `~` expands to the real home so the path matches
+ * what the spawned CLI resolves. The returned path is never read — callers
+ * only join it.
  */
 function resolveKimiDataHome(environment: NodeJS.ProcessEnv | undefined): string {
   const override = environment?.[KIMI_HOME_ENV]?.trim();
-  return override ? override : NodePath.join(NodeOS.homedir(), ".kimi-code");
+  if (!override) {
+    return NodePath.join(NodeOS.homedir(), ".kimi-code");
+  }
+  if (override === "~") {
+    return NodeOS.homedir();
+  }
+  if (override.startsWith("~/")) {
+    return NodePath.join(NodeOS.homedir(), override.slice(2));
+  }
+  return override;
 }
 
 /**

@@ -26,7 +26,7 @@ import {
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { KimiAdapterShape } from "../Services/KimiAdapter.ts";
-import { makeKimiAdapter } from "./KimiAdapter.ts";
+import { makeKimiAdapter, selectDecisionPermissionOptionId } from "./KimiAdapter.ts";
 import { execScriptSource, writeFakeCli } from "../../testUtils/fakeCli.ts";
 
 const decodeKimiSettings = Schema.decodeSync(KimiSettings);
@@ -1069,4 +1069,57 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
       yield* adapter.stopSession(threadId);
     }),
   );
+});
+
+function kimiPermissionRequest(
+  options: ReadonlyArray<{
+    readonly optionId: string;
+    readonly kind: "allow_once" | "allow_always" | "reject_once" | "reject_always";
+  }>,
+) {
+  return {
+    sessionId: "mock-session-1",
+    toolCall: {
+      toolCallId: "tool-call-1",
+      title: "cat package.json",
+      kind: "execute" as const,
+      status: "pending" as const,
+    },
+    options: options.map((option) => ({
+      optionId: option.optionId,
+      name: option.kind,
+      kind: option.kind,
+    })),
+  };
+}
+
+it("selects the offered option id matching the user's decision", () => {
+  const request = kimiPermissionRequest([
+    { optionId: "remember-this-command", kind: "allow_always" },
+    { optionId: "go-ahead-once", kind: "allow_once" },
+    { optionId: "not-today", kind: "reject_once" },
+  ]);
+
+  assert.equal(
+    selectDecisionPermissionOptionId(request, "acceptForSession"),
+    "remember-this-command",
+  );
+  assert.equal(selectDecisionPermissionOptionId(request, "accept"), "go-ahead-once");
+  assert.equal(selectDecisionPermissionOptionId(request, "decline"), "not-today");
+});
+
+it("degrades acceptForSession to the offered allow_once option", () => {
+  const request = kimiPermissionRequest([
+    { optionId: "go-ahead-once", kind: "allow_once" },
+    { optionId: "not-today", kind: "reject_once" },
+  ]);
+
+  assert.equal(selectDecisionPermissionOptionId(request, "acceptForSession"), "go-ahead-once");
+});
+
+it("falls back to the hardcoded acp outcome ids when no option kind matches", () => {
+  const request = kimiPermissionRequest([{ optionId: "not-today", kind: "reject_once" }]);
+
+  assert.equal(selectDecisionPermissionOptionId(request, "accept"), "allow-once");
+  assert.equal(selectDecisionPermissionOptionId(request, "acceptForSession"), "allow-always");
 });

@@ -267,6 +267,32 @@ function selectAutoApprovedPermissionOption(
   return undefined;
 }
 
+/**
+ * Picks the optionId Kimi actually offered for a user decision, matched by
+ * option kind. ACP option ids are provider-defined, so the hardcoded
+ * `acpPermissionOutcome` ids are only a fallback when nothing matches.
+ * acceptForSession degrades to an allow_once option when no allow_always is
+ * offered, so the response never selects an id Kimi never sent.
+ */
+export function selectDecisionPermissionOptionId(
+  request: EffectAcpSchema.RequestPermissionRequest,
+  decision: ProviderApprovalDecision,
+): string {
+  const kinds =
+    decision === "acceptForSession"
+      ? (["allow_always", "allow_once"] as const)
+      : decision === "accept"
+        ? (["allow_once"] as const)
+        : (["reject_once"] as const);
+  for (const kind of kinds) {
+    const option = request.options.find((entry) => entry.kind === kind);
+    if (typeof option?.optionId === "string" && option.optionId.trim()) {
+      return option.optionId.trim();
+    }
+  }
+  return acpPermissionOutcome(decision);
+}
+
 /** Map a single ElicitationPropertySchema entry to T3 UserInputQuestionOption values. */
 function elicitationPropertyToOptions(
   property: EffectAcpSchema.ElicitationPropertySchema,
@@ -838,7 +864,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                         ? ({ outcome: "cancelled" } as const)
                         : {
                             outcome: "selected" as const,
-                            optionId: acpPermissionOutcome(resolved),
+                            optionId: selectDecisionPermissionOptionId(params, resolved),
                           },
                   };
                 }),
