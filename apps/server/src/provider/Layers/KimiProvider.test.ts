@@ -57,6 +57,7 @@ describe("buildInitialKimiProviderSnapshot", () => {
       expect(snapshot.message).toContain("Checking Kimi");
       expect(snapshot.displayName).toBe("Kimi Code");
       expect(snapshot.supportsConversationRollback).toBe(false);
+      expect(snapshot.showInteractionModeToggle).toBe(true);
       expect(snapshot.models.map((model) => [model.slug, model.isDefault ?? false])).toEqual([
         ["kimi-code/kimi-for-coding", true],
         ["kimi-code/kimi-for-coding-highspeed", false],

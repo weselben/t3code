@@ -288,6 +288,12 @@ function elicitationPropertyToOptions(
     }
     return [];
   }
+  if (property.type === "boolean") {
+    return [
+      { label: "True", value: "true", description: "True" },
+      { label: "False", value: "false", description: "False" },
+    ];
+  }
   if (property.type === "array") {
     if ("enum" in property.items) {
       return property.items.enum.map((value) => ({
@@ -329,6 +335,43 @@ function allowedElicitationValues(
     }
   }
   return undefined;
+}
+
+/**
+ * Coerce string answers to the type the elicitation schema declares for the
+ * key. Clients transport option picks and custom answers as strings, so
+ * "true"/"false" become booleans and numeric strings become numbers for
+ * number/integer properties. Undeclared keys and non-convertible strings keep
+ * their raw value; `elicitationSchemaIssue` then reports the proper error.
+ */
+function normalizeElicitationAnswer(
+  schema: FormElicitationRequest["requestedSchema"],
+  key: string,
+  value: EffectAcpSchema.ElicitationContentValue,
+): EffectAcpSchema.ElicitationContentValue {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const property = schema.properties?.[key];
+  if (!property) {
+    return value;
+  }
+  if (property.type === "boolean") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+    return value;
+  }
+  if (property.type === "number" || property.type === "integer") {
+    const parsed = Number(value);
+    if (value.trim() === "" || !Number.isFinite(parsed)) {
+      return value;
+    }
+    if (property.type === "integer" && !Number.isInteger(parsed)) {
+      return value;
+    }
+    return parsed;
+  }
+  return value;
 }
 
 /**
@@ -1283,14 +1326,15 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
         }
         const content: Record<string, EffectAcpSchema.ElicitationContentValue> = {};
         for (const [key, value] of Object.entries(answers)) {
-          if (!isElicitationContentValue(value)) {
+          const normalized = normalizeElicitationAnswer(pending.requestedSchema, key, value);
+          if (!isElicitationContentValue(normalized)) {
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
               operation: "respondToUserInput",
               issue: `Answer for "${key}" must be a string, number, boolean, or array of strings.`,
             });
           }
-          content[key] = value;
+          content[key] = normalized;
         }
         const issue = elicitationSchemaIssue(pending.requestedSchema, content);
         if (issue) {

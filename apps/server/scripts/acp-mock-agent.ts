@@ -838,57 +838,85 @@ const program = Effect.gen(function* () {
                   },
                 },
               }
-            : emitKimiElicitationMode === "free-form-string"
+            : emitKimiElicitationMode === "number"
               ? {
                   type: "object",
-                  title: "Note",
-                  required: ["note"],
+                  title: "Count",
+                  required: ["count"],
                   properties: {
-                    note: {
-                      type: "string",
-                      title: "Note",
+                    count: {
+                      type: "number",
+                      title: "Count",
                     },
                   },
                 }
-              : emitKimiElicitationMode === "optional-color"
+              : emitKimiElicitationMode === "integer"
                 ? {
                     type: "object",
-                    title: "Optional color picker",
+                    title: "Retries",
+                    required: ["retries"],
                     properties: {
-                      color: {
-                        type: "string",
-                        title: "Color",
-                        oneOf: [
-                          { const: "red", title: "Red" },
-                          { const: "blue", title: "Blue" },
-                        ],
+                      retries: {
+                        type: "integer",
+                        title: "Retries",
                       },
                     },
                   }
-                : {
-                    type: "object",
-                    title: "Color picker",
-                    required: ["color"],
-                    properties: {
-                      color: {
-                        type: "string",
-                        title: "Color",
-                        oneOf: [
-                          { const: "red", title: "Red" },
-                          { const: "blue", title: "Blue" },
-                        ],
+                : emitKimiElicitationMode === "free-form-string"
+                  ? {
+                      type: "object",
+                      title: "Note",
+                      required: ["note"],
+                      properties: {
+                        note: {
+                          type: "string",
+                          title: "Note",
+                        },
                       },
-                    },
-                  };
+                    }
+                  : emitKimiElicitationMode === "optional-color"
+                    ? {
+                        type: "object",
+                        title: "Optional color picker",
+                        properties: {
+                          color: {
+                            type: "string",
+                            title: "Color",
+                            oneOf: [
+                              { const: "red", title: "Red" },
+                              { const: "blue", title: "Blue" },
+                            ],
+                          },
+                        },
+                      }
+                    : {
+                        type: "object",
+                        title: "Color picker",
+                        required: ["color"],
+                        properties: {
+                          color: {
+                            type: "string",
+                            title: "Color",
+                            oneOf: [
+                              { const: "red", title: "Red" },
+                              { const: "blue", title: "Blue" },
+                            ],
+                          },
+                        },
+                      };
         const elicitResult = yield* agent.client.elicit({
           mode: "form",
           sessionId: requestedSessionId,
           message:
             emitKimiElicitationMode === "boolean"
               ? "Please confirm"
-              : emitKimiElicitationMode === "free-form-string"
-                ? "Please leave a note"
-                : "Pick a color",
+              : emitKimiElicitationMode === "number"
+                ? "Please give a count"
+                : emitKimiElicitationMode === "integer"
+                  ? "Please give a retry count"
+                  : emitKimiElicitationMode === "free-form-string"
+                    ? "Please leave a note"
+                    : "Pick a color",
           requestedSchema: elicitRequestedSchema,
         });
         const elicitAction = elicitResult.action;
@@ -896,9 +924,13 @@ const program = Effect.gen(function* () {
         const chosen = chosenContent
           ? emitKimiElicitationMode === "boolean"
             ? String(chosenContent.agree ?? "nothing")
-            : emitKimiElicitationMode === "free-form-string"
-              ? String(chosenContent.note ?? "nothing")
-              : String(chosenContent.color ?? "nothing")
+            : emitKimiElicitationMode === "number"
+              ? String(chosenContent.count ?? "nothing")
+              : emitKimiElicitationMode === "integer"
+                ? String(chosenContent.retries ?? "nothing")
+                : emitKimiElicitationMode === "free-form-string"
+                  ? String(chosenContent.note ?? "nothing")
+                  : String(chosenContent.color ?? "nothing")
           : "nothing";
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,

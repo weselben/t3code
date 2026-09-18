@@ -656,7 +656,7 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
     }),
   );
 
-  it.effect("rejects type-mismatched boolean answers and keeps the request retryable", () =>
+  it.effect("coerces string boolean answers and keeps unconvertible ones retryable", () =>
     Effect.gen(function* () {
       const adapter = yield* KimiAdapter;
       const settings = yield* ServerSettingsService;
@@ -702,20 +702,153 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
         .pipe(Effect.forkChild);
 
       const requestedEvent = yield* Deferred.await(requested);
+      assert.deepEqual(
+        requestedEvent.payload.questions[0]?.options.map((option) => option.value),
+        ["true", "false"],
+      );
+      assert.equal(requestedEvent.payload.questions[0]?.allowCustomAnswer, false);
       const requestId = ApprovalRequestId.make(String(requestedEvent.requestId));
 
       const wrongType = yield* adapter
-        .respondToUserInput(threadId, requestId, { agree: "false" })
+        .respondToUserInput(threadId, requestId, { agree: "yes" })
         .pipe(Effect.flip);
       assert.equal(wrongType._tag, "ProviderAdapterValidationError");
       if (wrongType._tag === "ProviderAdapterValidationError") {
         assert.match(wrongType.issue, /Answer for "agree" must be a boolean\./);
       }
 
-      // The request is still pending, so a boolean answer resolves the turn.
-      yield* adapter.respondToUserInput(threadId, requestId, { agree: true });
+      // The request is still pending, so a string "true" answer resolves
+      // the turn with a coerced boolean.
+      yield* adapter.respondToUserInput(threadId, requestId, { agree: "true" });
       const resolvedEvent = yield* Deferred.await(resolved);
       assert.deepEqual(resolvedEvent.payload.answers, { agree: true });
+      yield* Fiber.join(sendTurnFiber);
+      yield* Deferred.await(completed);
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("coerces a numeric string answer for number properties", () =>
+    Effect.gen(function* () {
+      const adapter = yield* KimiAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("kimi-elicitation-number-thread");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_KIMI_EMIT_ELICIT: "number" }),
+      );
+      yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+      const requested =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
+      const resolved =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }>>();
+      const completed =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (String(event.threadId) !== String(threadId)) {
+          return Effect.void;
+        }
+        if (event.type === "user-input.requested") {
+          return Deferred.succeed(requested, event).pipe(Effect.ignore);
+        }
+        if (event.type === "user-input.resolved") {
+          return Deferred.succeed(resolved, event).pipe(Effect.ignore);
+        }
+        if (event.type === "turn.completed") {
+          return Deferred.succeed(completed, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "ask me for a count", attachments: [] })
+        .pipe(Effect.forkChild);
+
+      const requestedEvent = yield* Deferred.await(requested);
+      const requestId = ApprovalRequestId.make(String(requestedEvent.requestId));
+
+      yield* adapter.respondToUserInput(threadId, requestId, { count: "42" });
+      const resolvedEvent = yield* Deferred.await(resolved);
+      assert.deepEqual(resolvedEvent.payload.answers, { count: 42 });
+      yield* Fiber.join(sendTurnFiber);
+      yield* Deferred.await(completed);
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects a non-integer string for integer properties and stays retryable", () =>
+    Effect.gen(function* () {
+      const adapter = yield* KimiAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("kimi-elicitation-integer-thread");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_KIMI_EMIT_ELICIT: "integer" }),
+      );
+      yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+      const requested =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
+      const resolved =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }>>();
+      const completed =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (String(event.threadId) !== String(threadId)) {
+          return Effect.void;
+        }
+        if (event.type === "user-input.requested") {
+          return Deferred.succeed(requested, event).pipe(Effect.ignore);
+        }
+        if (event.type === "user-input.resolved") {
+          return Deferred.succeed(resolved, event).pipe(Effect.ignore);
+        }
+        if (event.type === "turn.completed") {
+          return Deferred.succeed(completed, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "ask me for retries", attachments: [] })
+        .pipe(Effect.forkChild);
+
+      const requestedEvent = yield* Deferred.await(requested);
+      const requestId = ApprovalRequestId.make(String(requestedEvent.requestId));
+
+      const wrongType = yield* adapter
+        .respondToUserInput(threadId, requestId, { retries: "4.5" })
+        .pipe(Effect.flip);
+      assert.equal(wrongType._tag, "ProviderAdapterValidationError");
+      if (wrongType._tag === "ProviderAdapterValidationError") {
+        assert.match(wrongType.issue, /Answer for "retries" must be an integer\./);
+      }
+
+      // The request is still pending, so an integer string resolves the turn.
+      yield* adapter.respondToUserInput(threadId, requestId, { retries: "4" });
+      const resolvedEvent = yield* Deferred.await(resolved);
+      assert.deepEqual(resolvedEvent.payload.answers, { retries: 4 });
       yield* Fiber.join(sendTurnFiber);
       yield* Deferred.await(completed);
 

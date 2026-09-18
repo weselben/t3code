@@ -42,7 +42,7 @@ const KIMI_PRESENTATION = {
   displayName: "Kimi Code",
   supportsConversationRollback: false,
   badgeLabel: "Early Access",
-  showInteractionModeToggle: false,
+  showInteractionModeToggle: true,
 } as const;
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
