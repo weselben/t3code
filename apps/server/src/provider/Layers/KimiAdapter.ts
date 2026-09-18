@@ -77,6 +77,7 @@ const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonStri
 const PROVIDER = ProviderDriverKind.make("kimi");
 const KIMI_RESUME_VERSION = 1 as const;
 
+/** Serializes diagnostic payloads when they are representable as JSON. */
 function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
   const result = encodeUnknownJsonStringExit(input);
   return Exit.isSuccess(result) ? result.value : undefined;
@@ -156,6 +157,7 @@ interface KimiSessionContext {
   stopped: boolean;
 }
 
+/** Cancels and consumes every outstanding permission request for a session. */
 function settlePendingApprovalsAsCancelled(
   pendingApprovals: Map<ApprovalRequestId, PendingApproval>,
 ): Effect.Effect<void> {
@@ -172,6 +174,7 @@ function settlePendingApprovalsAsCancelled(
   );
 }
 
+/** Cancels and consumes every outstanding elicitation request for a session. */
 function settlePendingUserInputsAsCancelled(
   pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>,
 ): Effect.Effect<void> {
@@ -188,10 +191,12 @@ function settlePendingUserInputsAsCancelled(
   );
 }
 
+/** Narrows a non-null, non-array object to a string-keyed record. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Decodes the versioned session identifier stored in Kimi resume metadata. */
 function parseKimiResume(raw: unknown): { sessionId: string } | undefined {
   if (!isRecord(raw)) return undefined;
   if (raw.schemaVersion !== KIMI_RESUME_VERSION) return undefined;
@@ -199,6 +204,7 @@ function parseKimiResume(raw: unknown): { sessionId: string } | undefined {
   return { sessionId: raw.sessionId.trim() };
 }
 
+/** Applies requested model and interaction-mode changes to an ACP session. */
 function applyRequestedSessionConfiguration<E>(input: {
   readonly runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
   readonly runtimeMode: RuntimeMode;
@@ -244,6 +250,7 @@ function applyRequestedSessionConfiguration<E>(input: {
   });
 }
 
+/** Chooses Kimi's most permissive available option for an auto-approved request. */
 function selectAutoApprovedPermissionOption(
   request: EffectAcpSchema.RequestPermissionRequest,
 ): string | undefined {
