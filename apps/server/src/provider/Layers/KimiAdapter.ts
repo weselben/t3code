@@ -347,8 +347,8 @@ function allowedElicitationValues(
 function normalizeElicitationAnswer(
   schema: FormElicitationRequest["requestedSchema"],
   key: string,
-  value: EffectAcpSchema.ElicitationContentValue,
-): EffectAcpSchema.ElicitationContentValue {
+  value: unknown,
+): unknown {
   if (typeof value !== "string") {
     return value;
   }
