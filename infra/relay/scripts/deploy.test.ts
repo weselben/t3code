@@ -179,6 +179,8 @@ describe("serializeRelayClientTracingEnvironment", () => {
   });
 });
 
+// The upstream workflow assertions only apply where release.yml exists;
+// this fork's adapted CI set drops it, so the test becomes a no-op there.
 describe("release workflow tracing config propagation", () => {
   it.effect("uses an artifact instead of a masked cross-job token output", () =>
     Effect.gen(function* () {
@@ -187,6 +189,9 @@ describe("release workflow tracing config propagation", () => {
       const workflowPath = yield* path.fromFileUrl(
         new URL("../../../.github/workflows/release.yml", import.meta.url),
       );
+      if (!(yield* fileSystem.exists(workflowPath))) {
+        return;
+      }
       const workflow = yield* fileSystem.readFileString(workflowPath);
 
       expect(workflow).not.toContain("client_tracing_token:");

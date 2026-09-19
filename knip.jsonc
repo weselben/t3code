@@ -14,7 +14,9 @@
     },
     "scripts": {
       // Knip loads its preprocessor through a CLI option; native verification runs directly.
-      "entry": ["knip-schemas.ts", "mobile-native-client.ts"],
+      // smoke-cli-archive.ts is the release-archive smoke entry; upstream's release.yml
+      // is the caller and this fork's CI set drops it, so declare the script as an entry.
+      "entry": ["knip-schemas.ts", "mobile-native-client.ts", "smoke-cli-archive.ts"],
     },
     "apps/server": {
       // Vite+ pack entries and the launcher used by installed background services.
