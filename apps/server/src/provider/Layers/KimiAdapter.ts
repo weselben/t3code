@@ -271,15 +271,17 @@ function selectAutoApprovedPermissionOption(
  * Picks the optionId Kimi actually offered for a user decision, matched by
  * option kind. ACP option ids are provider-defined, so the hardcoded
  * `acpPermissionOutcome` ids are only a fallback when nothing matches.
- * acceptForSession degrades to an allow_once option when no allow_always is
- * offered, so the response never selects an id Kimi never sent.
+ * acceptForSession and acceptAlways degrade to an allow_once option when no
+ * allow_always is offered, so the response never selects an id Kimi never
+ * sent. acceptAlways is not covered by `acpPermissionOutcome`, so its
+ * hardcoded fallback is "allow-always".
  */
 export function selectDecisionPermissionOptionId(
   request: EffectAcpSchema.RequestPermissionRequest,
   decision: ProviderApprovalDecision,
 ): string {
   const kinds =
-    decision === "acceptForSession"
+    decision === "acceptForSession" || decision === "acceptAlways"
       ? (["allow_always", "allow_once"] as const)
       : decision === "accept"
         ? (["allow_once"] as const)
@@ -290,7 +292,7 @@ export function selectDecisionPermissionOptionId(
       return option.optionId.trim();
     }
   }
-  return acpPermissionOutcome(decision);
+  return decision === "acceptAlways" ? "allow-always" : acpPermissionOutcome(decision);
 }
 
 /** Map a single ElicitationPropertySchema entry to T3 UserInputQuestionOption values. */

@@ -1123,3 +1123,28 @@ it("falls back to the hardcoded acp outcome ids when no option kind matches", ()
   assert.equal(selectDecisionPermissionOptionId(request, "accept"), "allow-once");
   assert.equal(selectDecisionPermissionOptionId(request, "acceptForSession"), "allow-always");
 });
+
+it("selects the offered allow_always option for acceptAlways", () => {
+  const request = kimiPermissionRequest([
+    { optionId: "remember-this-command", kind: "allow_always" },
+    { optionId: "go-ahead-once", kind: "allow_once" },
+    { optionId: "not-today", kind: "reject_once" },
+  ]);
+
+  assert.equal(selectDecisionPermissionOptionId(request, "acceptAlways"), "remember-this-command");
+});
+
+it("degrades acceptAlways to the offered allow_once option", () => {
+  const request = kimiPermissionRequest([
+    { optionId: "go-ahead-once", kind: "allow_once" },
+    { optionId: "not-today", kind: "reject_once" },
+  ]);
+
+  assert.equal(selectDecisionPermissionOptionId(request, "acceptAlways"), "go-ahead-once");
+});
+
+it("falls back to the hardcoded allow-always outcome for acceptAlways", () => {
+  const request = kimiPermissionRequest([{ optionId: "not-today", kind: "reject_once" }]);
+
+  assert.equal(selectDecisionPermissionOptionId(request, "acceptAlways"), "allow-always");
+});
