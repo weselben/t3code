@@ -1069,6 +1069,129 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
       yield* adapter.stopSession(threadId);
     }),
   );
+
+  it.effect("runs synthetic /plan in kimi plan mode for one turn, then restores the mode", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kimi-plan-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kimi-acp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, NodePath.join(logDir, "argv.tsv")),
+      );
+
+      const rawAdapter = yield* makeKimiAdapter(decodeKimiSettings({ binaryPath: wrapperPath }));
+
+      yield* rawAdapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* rawAdapter.sendTurn({
+        threadId,
+        input: "/plan write the parser tests",
+        attachments: [],
+      });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const modeValues = requests
+        .filter(
+          (request) =>
+            request.method === "session/set_config_option" &&
+            (request.params as Record<string, unknown> | undefined)?.configId === "mode",
+        )
+        .map((request) => (request.params as Record<string, unknown>).value);
+      assert.deepStrictEqual(modeValues, ["yolo", "plan", "yolo"]);
+
+      const promptRequest = requests.find((request) => request.method === "session/prompt");
+      assert.ok(promptRequest, "expected a session/prompt request");
+      const promptBlocks = (promptRequest.params as Record<string, unknown>).prompt as Array<{
+        type: string;
+        text?: string;
+      }>;
+      assert.equal(promptBlocks[0]?.text, "write the parser tests");
+
+      yield* rawAdapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("maps a synthetic /goal prompt onto Kimi's native write-goal command", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kimi-goal-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kimi-acp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, NodePath.join(logDir, "argv.tsv")),
+      );
+
+      const rawAdapter = yield* makeKimiAdapter(decodeKimiSettings({ binaryPath: wrapperPath }));
+
+      yield* rawAdapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* rawAdapter.sendTurn({
+        threadId,
+        input: "/goal ship the release",
+        attachments: [],
+      });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const promptRequest = requests.find((request) => request.method === "session/prompt");
+      assert.ok(promptRequest, "expected a session/prompt request");
+      const promptBlocks = (promptRequest.params as Record<string, unknown>).prompt as Array<{
+        type: string;
+        text?: string;
+      }>;
+      assert.equal(promptBlocks[0]?.text, "/write-goal ship the release");
+
+      yield* rawAdapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects synthetic commands without their required arguments", () =>
+    Effect.gen(function* () {
+      const adapter = yield* KimiAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("kimi-synthetic-usage-thread");
+
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const planError = yield* adapter
+        .sendTurn({ threadId, input: "/plan", attachments: [] })
+        .pipe(Effect.flip);
+      assert.equal(planError._tag, "ProviderAdapterValidationError");
+      if (planError._tag !== "ProviderAdapterValidationError") return;
+      assert.equal(planError.operation, "sendTurn");
+      assert.ok(planError.issue.includes("Usage: /plan"), planError.issue);
+
+      const goalError = yield* adapter
+        .sendTurn({ threadId, input: "/goal", attachments: [] })
+        .pipe(Effect.flip);
+      assert.equal(goalError._tag, "ProviderAdapterValidationError");
+      if (goalError._tag !== "ProviderAdapterValidationError") return;
+      assert.equal(goalError.operation, "sendTurn");
+      assert.ok(goalError.issue.includes("Usage: /goal"), goalError.issue);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
 });
 
 function kimiPermissionRequest(

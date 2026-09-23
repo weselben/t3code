@@ -149,6 +149,24 @@ export function currentKimiModelIdFromSessionSetup(
 }
 
 const KIMI_PLAN_MODE_ALIASES = ["plan"];
+
+/**
+ * Resolves the plan mode from the modes the session advertises, if any.
+ * The synthetic `/plan` command switches to this mode for a single turn.
+ */
+export function findKimiPlanMode(modeState: AcpSessionModeState): AcpSessionMode | undefined {
+  return findModeByAliases(modeState.availableModes, KIMI_PLAN_MODE_ALIASES);
+}
+
+/**
+ * Kimi 2.0.x applies a switch to its plan mode but still answers the
+ * `session/set_config_option` request with "Internal error: Already in plan
+ * mode" — the session's own reasoning stream proves the mode is active.
+ * The mode-switch paths treat this defect as success.
+ */
+export function isKimiAlreadyInPlanModeError(causeMessage: string): boolean {
+  return causeMessage.includes("Already in plan mode");
+}
 const KIMI_APPROVAL_MODE_ALIASES = ["default"];
 const KIMI_AUTO_MODE_ALIASES = ["auto"];
 const KIMI_FULL_ACCESS_MODE_ALIASES = ["yolo"];
@@ -267,4 +285,70 @@ export function classifyKimiSubagentLabel(
     return "Agent swarm";
   }
   return undefined;
+}
+
+/**
+ * Kimi's TUI arms `/plan`, `/goal`, and `/swarm` as message commands, but its
+ * ACP server advertises neither and rejects them as unknown commands. T3
+ * re-publishes them as synthetic provider commands and rewrites matching
+ * prompts before they reach the ACP session, so every client (web, desktop,
+ * mobile) can drive the behavior without client-side changes.
+ */
+export type KimiSyntheticCommand = "plan" | "goal";
+
+export interface KimiSyntheticCommandDefinition {
+  readonly command: KimiSyntheticCommand;
+  readonly description: string;
+  readonly inputHint: string;
+}
+
+/**
+ * Order matters: the composer lists commands in this order. Native Kimi
+ * commands always win on a name clash, so these only fill the gaps.
+ */
+export const KIMI_SYNTHETIC_COMMANDS: ReadonlyArray<KimiSyntheticCommandDefinition> = [
+  {
+    command: "plan",
+    description: "Plan the given task read-only for this turn, then return to the thread mode.",
+    inputHint: "what to plan",
+  },
+  {
+    command: "goal",
+    description: "Create a goal Kimi keeps working toward across turns.",
+    inputHint: "objective, optionally with a completion criterion",
+  },
+];
+
+/** Matches a leading synthetic command with its argument text, if any. */
+const KIMI_SYNTHETIC_COMMAND_PATTERN = /^\/(plan|goal)(?:\s+([\s\S]+))?$/;
+
+export interface KimiSyntheticPrompt {
+  readonly command: KimiSyntheticCommand;
+  readonly args: string;
+}
+
+/**
+ * Recognizes a prompt that starts with a synthetic Kimi command. The match is
+ * anchored to the whole prompt so questions that merely mention a command are
+ * forwarded to Kimi unchanged.
+ */
+export function matchKimiSyntheticPrompt(rawPrompt: string): KimiSyntheticPrompt | undefined {
+  const match = KIMI_SYNTHETIC_COMMAND_PATTERN.exec(rawPrompt.trim());
+  if (!match) {
+    return undefined;
+  }
+  return {
+    command: match[1] as KimiSyntheticCommand,
+    args: (match[2] ?? "").trim(),
+  };
+}
+
+/**
+ * Maps the synthetic `/goal` command onto Kimi's own advertised
+ * `write-goal` command — the same goal-authoring flow Kimi's TUI runs when
+ * a prompt is turned into a goal. Kimi executes it natively; the user's
+ * prompt is forwarded verbatim.
+ */
+export function buildKimiGoalPrompt(args: string): string {
+  return `/write-goal ${args}`;
 }

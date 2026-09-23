@@ -40,15 +40,17 @@ runs.
 
 Type `/` in the composer to see Kimi's remote commands, for example `/compact`, `/status`,
 `/usage`, `/tasks`, and your Kimi skills. Commands that only make sense inside the Kimi terminal
-UI, such as `/theme`, are not offered.
+UI, such as `/theme` and `/swarm`, are not offered.
 
 ## Known limits
 
-- Kimi's `/goal` and `/plan` commands are terminal-only (confirmed through Kimi Code CLI 2.0.x)
-  and are not reachable from T3 Code. Typing them anyway makes Kimi answer with an
-  "Unknown ACP command" error. For plan mode use the thread's Plan/Build toggle, which maps to
-  Kimi's Plan mode. For goals, ask for one in plain language ("create a goal for ...") — the
-  CreateGoal tool works over ACP.
+- Kimi's `/plan` and `/goal` commands work here as T3-side additions, because Kimi's ACP server
+  rejects the TUI's message commands. `/plan <task>` runs the request in Kimi's native plan mode
+  for that single turn and restores the thread's approval mode afterwards; the thread's
+  Plan/Build toggle stays the way to plan across several turns. `/goal <objective>` maps onto
+  Kimi's own `write-goal` command — the same flow Kimi's TUI uses to turn a prompt into a goal.
+  Kimi's `/swarm` and `/theme` stay terminal-only: `/swarm` has no ACP surface, so it is not
+  approximated.
 - Kimi has no separate "accept edits" permission level. The approval modes map to Kimi's
   Default, Auto, and YOLO modes.
 - Updates are manual: run `kimi upgrade` on the server machine.

@@ -49,6 +49,7 @@ import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
+  type ProviderAdapterError,
 } from "../Errors.ts";
 import { acpPermissionOutcome, mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
@@ -64,11 +65,16 @@ import { type AcpToolCallState, parsePermissionRequest } from "../acp/AcpRuntime
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
 import {
   applyKimiAcpModelSelection,
+  buildKimiGoalPrompt,
   classifyKimiSubagentLabel,
   currentKimiModelIdFromSessionSetup,
+  findKimiPlanMode,
+  isKimiAlreadyInPlanModeError,
   makeKimiAcpRuntime,
+  matchKimiSyntheticPrompt,
   resolveKimiAcpBaseModelId,
   resolveRequestedKimiModeId,
+  type KimiSyntheticPrompt,
 } from "../acp/KimiAcpSupport.ts";
 import { type KimiAdapterShape } from "../Services/KimiAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -162,6 +168,10 @@ interface KimiSessionContext {
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
   promptsInFlight: number;
+  /** Mode id to restore when the current turn settles. Set by a synthetic
+   * `/plan` command so the read-only planning request does not outlive its
+   * turn, mirroring Kimi's message-scoped plan behavior. */
+  planRestoreModeId: string | undefined;
   /** Provider-initiated turn (cron fire, background-agent report): open while
    * passive events stream, closed after an idle gap or by the next sendTurn. */
   passiveTurn:
@@ -172,6 +182,95 @@ interface KimiSessionContext {
     | undefined;
   stopped: boolean;
 }
+
+/**
+ * Switches the Kimi session mode, tolerating the Kimi 2.0.x defect where a
+ * switch to plan mode applies but the request still fails with
+ * "Internal error: Already in plan mode". Every other failure propagates.
+ */
+const setKimiSessionModeTolerant = <E>(
+  setMode: (modeId: string) => Effect.Effect<unknown, E>,
+  modeId: string,
+  mapError: (cause: E) => ProviderAdapterError,
+): Effect.Effect<void, ProviderAdapterError> =>
+  Effect.gen(function* () {
+    const outcome = yield* Effect.exit(setMode(modeId));
+    if (Exit.isSuccess(outcome)) {
+      return;
+    }
+    const cause = (outcome.failure as { readonly cause?: unknown }).cause;
+    const causeMessage = cause instanceof Error ? cause.message : String(cause ?? "");
+    if (isKimiAlreadyInPlanModeError(causeMessage)) {
+      return;
+    }
+    return yield* Effect.fail(mapError(outcome.failure));
+  });
+
+/**
+ * Applies a synthetic `/plan` or `/goal` prompt before it reaches the ACP
+ * session. Kimi's TUI arms these as message commands, but its ACP server
+ * advertises neither and rejects them as unknown.
+ *
+ * `/plan` switches the session to Kimi's native plan mode for the current
+ * turn and forwards the arguments verbatim; the previous mode is restored
+ * once the turn settles (see the sendTurn `ensuring` block). `/goal` is
+ * rewritten into an instruction because ACP exposes no goal surface. Kimi's
+ * `/swarm` has no ACP surface either, so it stays unsupported instead of
+ * being approximated with prompt text.
+ */
+const applyKimiSyntheticCommand = (
+  ctx: KimiSessionContext,
+  synthetic: KimiSyntheticPrompt,
+  threadId: ThreadId,
+): Effect.Effect<string, ProviderAdapterError | ProviderAdapterValidationError> =>
+  Effect.gen(function* () {
+    switch (synthetic.command) {
+      case "plan": {
+        if (!synthetic.args) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue:
+              "Usage: /plan <what to plan> — the request runs in Kimi's plan mode for this turn only.",
+          });
+        }
+        const modeState = yield* ctx.acp.getModeState;
+        const planMode = modeState === undefined ? undefined : findKimiPlanMode(modeState);
+        if (planMode === undefined || modeState === undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "This Kimi session does not expose a plan mode.",
+          });
+        }
+        if (planMode.id !== modeState.currentModeId) {
+          ctx.planRestoreModeId = modeState.currentModeId;
+          yield* setKimiSessionModeTolerant(
+            (modeId) => ctx.acp.setMode(modeId),
+            planMode.id,
+            (cause) => mapAcpToAdapterError(PROVIDER, threadId, "session/set_mode", cause),
+          ).pipe(
+            Effect.tapError(() =>
+              Effect.sync(() => {
+                ctx.planRestoreModeId = undefined;
+              }),
+            ),
+          );
+        }
+        return synthetic.args;
+      }
+      case "goal": {
+        if (!synthetic.args) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "Usage: /goal <objective> — optionally include a completion criterion.",
+          });
+        }
+        return buildKimiGoalPrompt(synthetic.args);
+      }
+    }
+  });
 
 /** Cancels and consumes every outstanding permission request for a session. */
 function settlePendingApprovalsAsCancelled(
@@ -255,13 +354,10 @@ function applyRequestedSessionConfiguration<E>(input: {
       return;
     }
 
-    yield* input.runtime.setMode(requestedModeId).pipe(
-      Effect.mapError((cause) =>
-        input.mapError({
-          cause,
-          method: "session/set_mode",
-        }),
-      ),
+    yield* setKimiSessionModeTolerant(
+      (modeId) => input.runtime.setMode(modeId),
+      requestedModeId,
+      (cause) => input.mapError({ cause, method: "session/set_mode" }),
     );
   });
 }
@@ -1069,6 +1165,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             activeTurnId: undefined,
             currentModelId,
             promptsInFlight: 0,
+            planRestoreModeId: undefined,
             passiveTurn: undefined,
             stopped: false,
           };
@@ -1252,13 +1349,11 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             modeState: yield* ctx.acp.getModeState,
           });
           if (requestedModeId) {
-            yield* ctx.acp
-              .setMode(requestedModeId)
-              .pipe(
-                Effect.mapError((cause) =>
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_mode", cause),
-                ),
-              );
+            yield* setKimiSessionModeTolerant(
+              (modeId) => ctx.acp.setMode(modeId),
+              requestedModeId,
+              (cause) => mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_mode", cause),
+            );
           }
 
           ctx.session = {
@@ -1280,8 +1375,18 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
 
           const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
           const rawPrompt = input.input?.trim() ?? "";
-          if (rawPrompt) {
-            promptParts.push({ type: "text", text: rawPrompt });
+          // Synthetic /plan, /goal, and /swarm: Kimi's ACP server rejects the
+          // TUI's message commands as unknown, so matching prompts are
+          // rewritten before they reach the session. /plan additionally
+          // switches the session to its plan mode for this turn and restores
+          // the previous mode once the turn settles.
+          const synthetic = matchKimiSyntheticPrompt(rawPrompt);
+          const effectivePrompt =
+            synthetic === undefined
+              ? rawPrompt
+              : yield* applyKimiSyntheticCommand(ctx, synthetic, input.threadId);
+          if (effectivePrompt) {
+            promptParts.push({ type: "text", text: effectivePrompt });
           }
           if (input.attachments && input.attachments.length > 0) {
             for (const attachment of input.attachments) {
@@ -1332,7 +1437,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
           // command into an ordinary model prompt or change its arguments.
           const result = yield* ctx.acp
             .prompt({
-              prompt: /^\/[^\s/]+(?:\s|$)/.test(rawPrompt)
+              prompt: /^\/[^\s/]+(?:\s|$)/.test(effectivePrompt)
                 ? promptParts
                 : [
                     ...promptParts,
@@ -1390,8 +1495,26 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
           };
         }).pipe(
           Effect.ensuring(
-            Effect.sync(() => {
+            Effect.gen(function* () {
               ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+              // A synthetic /plan restores the session's previous mode once the
+              // last prompt of the turn settles, including cancelled or failed
+              // prompts. Restore errors are swallowed: the turn result must
+              // not be masked by a failed best-effort mode reset.
+              if (ctx.promptsInFlight === 0 && ctx.planRestoreModeId !== undefined) {
+                const restoreModeId = ctx.planRestoreModeId;
+                ctx.planRestoreModeId = undefined;
+                yield* Effect.ignore(
+                  ctx.acp
+                    .setMode(restoreModeId)
+                    .pipe(
+                      Effect.mapError((error) =>
+                        mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_mode", error),
+                      ),
+                    ),
+                );
+                yield* Effect.ignore(ctx.acp.drainEvents);
+              }
             }),
           ),
         );
