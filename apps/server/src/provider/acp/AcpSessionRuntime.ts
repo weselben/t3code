@@ -88,6 +88,13 @@ export interface AcpSessionRuntimeOptions {
   /** Native cancellation waits for the prompt response and the getEvents consumer to drain. */
   readonly cancelBehavior?: "interrupt" | "wait-for-prompt";
   readonly cancelTimeout?: Duration.Input;
+  /**
+   * Let assistant chunks through while no client prompt is active. For
+   * harnesses that act on their own (cron fires, background agents) — the
+   * adapter turns the burst into a provider-initiated turn. Defaults to off,
+   * which drops stray chunks between prompts.
+   */
+  readonly passiveAssistantUpdates?: boolean;
   readonly clientCapabilities?: EffectAcpSchema.InitializeRequest["clientCapabilities"];
   readonly clientInfo: {
     readonly name: string;
@@ -583,7 +590,16 @@ export const make = (
             (notification.update.sessionUpdate === "agent_message_chunk" ||
               notification.update.sessionUpdate === "agent_thought_chunk")
           ) {
-            return;
+            // Harnesses that act on their own (cron fires, background agents)
+            // stream assistant chunks while no client prompt is active. The
+            // drop above shields providers that never do this; opt-in runtimes
+            // let the chunks through so the adapter can surface them as a
+            // provider-initiated turn.
+            if (options.passiveAssistantUpdates !== true) {
+              return;
+            }
+            yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
+            yield* Ref.set(assistantUpdatesOpenRef, true);
           }
           yield* processSessionUpdate(notification);
         }),

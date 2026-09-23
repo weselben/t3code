@@ -17,6 +17,7 @@ const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const kimiProfile = process.env.T3_ACP_KIMI === "1";
 const emitKimiSubagentToolCalls = process.env.T3_ACP_KIMI_EMIT_SUBAGENT_TOOL_CALLS === "1";
+const emitKimiPassiveChunk = process.env.T3_ACP_KIMI_EMIT_PASSIVE_CHUNK === "1";
 const emitKimiElicitationMode = process.env.T3_ACP_KIMI_EMIT_ELICIT;
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitInterleavedAssistantToolCalls =
@@ -739,6 +740,20 @@ const program = Effect.gen(function* () {
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
+      if (emitKimiPassiveChunk) {
+        // Harness-initiated output: fires long after the prompt response has
+        // been written, so only a runtime passing passive updates through
+        // will surface it.
+        setTimeout(() => {
+          writeJsonRpcNotification("session/update", {
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "background kimi-side update landed" },
+            },
+          });
+        }, 1500);
+      }
 
       if (completeFirstPromptOnCancel && promptCount === 1) {
         yield* agent.client.sessionUpdate({

@@ -78,6 +78,10 @@ export const makeKimiAcpRuntime = (
             form: {},
           },
         },
+        // Kimi's harness acts on its own: cron fires and background-agent
+        // completions stream assistant chunks between user prompts. Without
+        // this the runtime drops them and the thread never sees the update.
+        passiveAssistantUpdates: true,
       }).pipe(
         Layer.provide(
           Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, input.childProcessSpawner),

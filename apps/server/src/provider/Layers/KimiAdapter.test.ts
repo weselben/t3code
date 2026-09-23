@@ -5,7 +5,7 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -1147,4 +1147,65 @@ it("falls back to the hardcoded allow-always outcome for acceptAlways", () => {
   const request = kimiPermissionRequest([{ optionId: "not-today", kind: "reject_once" }]);
 
   assert.equal(selectDecisionPermissionOptionId(request, "acceptAlways"), "allow-always");
+});
+
+// Live clock only: passive updates arrive on the real event loop, and the
+// runtime's queue-pull pipeline does not advance while the test clock is
+// frozen.
+describe("KimiAdapterPassiveUpdates", () => {
+  it.live("surfaces passive kimi chunks as a provider-initiated turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kimi-passive-thread");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_KIMI_EMIT_PASSIVE_CHUNK: "1" }),
+      );
+
+      const rawAdapter = yield* makeKimiAdapter(decodeKimiSettings({ binaryPath: wrapperPath }), {
+        passiveTurnIdleMs: 300,
+      });
+
+      const events: ProviderRuntimeEvent[] = [];
+      const drainFiber = yield* rawAdapter.streamEvents.pipe(
+        Stream.runForEach((event) => Effect.sync(() => events.push(event))),
+        Effect.forkChild,
+      );
+
+      yield* rawAdapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* rawAdapter.sendTurn({ threadId, input: "hello", attachments: [] });
+
+      // The passive chunk fires ~1.5s after the prompt started; the idle
+      // close follows 300ms after the burst.
+      yield* Effect.sleep(2500);
+
+      const turnStarts = events.filter((event) => event.type === "turn.started");
+      assert.equal(turnStarts.length, 2, "expected a real and a passive turn.started");
+      const passiveTurn = turnStarts[1];
+
+      const passiveDelta = events.find(
+        (event) =>
+          event.type === "content.delta" &&
+          event.payload.delta.includes("background kimi-side update"),
+      );
+      assert.ok(passiveDelta, "expected the passive chunk as content.delta");
+      assert.deepEqual(passiveDelta.turnId, passiveTurn.turnId);
+
+      yield* Fiber.interrupt(drainFiber);
+      yield* rawAdapter.stopSession(threadId);
+
+      const turnCompletions = events.filter((event) => event.type === "turn.completed");
+      assert.equal(turnCompletions.length, 2, "expected the passive turn to close");
+      assert.deepEqual(turnCompletions[1]?.turnId, passiveTurn.turnId);
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3code-kimi-passive-test-",
+        }).pipe(Layer.provideMerge(NodeServices.layer)),
+      ),
+    ),
+  );
 });

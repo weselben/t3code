@@ -30,6 +30,9 @@ runs.
 - **Sub-agents.** When Kimi dispatches an `Agent` or an `AgentSwarm`, the thread shows a spawn
   row. Kimi keeps sub-agent work isolated, so you see the dispatch and the final result, not the
   inner tool calls.
+- **Background updates.** Kimi-side work that runs on its own — cron reminders, background
+  agents returning — reports back into the thread as a provider-initiated turn, the same way a
+  message from the agent would appear.
 - **Questions.** When Kimi asks you a question or requests a tool approval, the thread shows the
   same question panel and approval controls as other providers.
 

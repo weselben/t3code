@@ -75,6 +75,9 @@ import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogg
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("kimi");
+
+/** How long a provider-initiated turn stays open after its last passive event. */
+const KIMI_PASSIVE_TURN_IDLE_MS_DEFAULT = 10_000;
 const KIMI_RESUME_VERSION = 1 as const;
 
 /** Serializes diagnostic payloads when they are representable as JSON. */
@@ -96,6 +99,11 @@ export interface KimiAdapterLiveOptions {
    * Defaults to the legacy built-in instance id (`kimi`).
    */
   readonly instanceId?: ProviderInstanceId;
+  /**
+   * How long a provider-initiated (synthetic) turn stays open after its last
+   * passive event. Tests shrink this; production keeps the default.
+   */
+  readonly passiveTurnIdleMs?: number;
   /**
    * Optional per-session settings resolver. When provided the adapter yields
    * this effect at the start of every session and uses the result instead of
@@ -154,6 +162,14 @@ interface KimiSessionContext {
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
   promptsInFlight: number;
+  /** Provider-initiated turn (cron fire, background-agent report): open while
+   * passive events stream, closed after an idle gap or by the next sendTurn. */
+  passiveTurn:
+    | {
+        readonly turnId: TurnId;
+        timerHandle: NodeJS.Timeout | undefined;
+      }
+    | undefined;
   stopped: boolean;
 }
 
@@ -552,6 +568,7 @@ function makeKimiToolCallEvent(input: {
 export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapterLiveOptions) {
   return Effect.gen(function* () {
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("kimi");
+    const passiveTurnIdleMs = options?.passiveTurnIdleMs ?? KIMI_PASSIVE_TURN_IDLE_MS_DEFAULT;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -599,6 +616,72 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
 
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
+
+    const completePassiveTurn = (ctx: KimiSessionContext) =>
+      Effect.gen(function* () {
+        const passive = ctx.passiveTurn;
+        if (!passive) {
+          return;
+        }
+        ctx.passiveTurn = undefined;
+        if (passive.timerHandle !== undefined) {
+          clearTimeout(passive.timerHandle);
+        }
+        yield* offerRuntimeEvent({
+          type: "turn.completed",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId: passive.turnId,
+          payload: { state: "completed", stopReason: null },
+        });
+        ctx.activeTurnId = undefined;
+        ctx.session = {
+          ...ctx.session,
+          status: "ready",
+          activeTurnId: undefined,
+          updatedAt: yield* nowIso,
+        };
+      });
+
+    // Passive bursts (cron fires, background-agent reports) arrive without a
+    // client prompt. Auto-start a synthetic turn for them — the same approach
+    // the Claude adapter takes — and close it after an idle gap so the
+    // session does not stay "running" forever. A real sendTurn closes the
+    // stale synthetic turn first, so it never blocks the user's next prompt.
+    const ensurePassiveTurn = (ctx: KimiSessionContext) =>
+      Effect.gen(function* () {
+        if (ctx.promptsInFlight > 0 || ctx.passiveTurn !== undefined) {
+          return;
+        }
+        const turnId = TurnId.make(yield* randomUUIDv4);
+        const stamp = yield* makeEventStamp();
+        ctx.passiveTurn = { turnId, timerHandle: undefined };
+        ctx.activeTurnId = turnId;
+        ctx.session = {
+          ...ctx.session,
+          status: "running",
+          activeTurnId: turnId,
+          updatedAt: yield* nowIso,
+        };
+        yield* offerRuntimeEvent({
+          type: "turn.started",
+          ...stamp,
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId,
+          payload: {},
+        });
+        // The idle close runs on the default Effect runtime from a raw
+        // timer, so no external fiber or runtime capture is involved.
+        const timerHandle = setTimeout(() => {
+          if (ctx.passiveTurn?.turnId !== turnId || ctx.promptsInFlight > 0 || ctx.stopped) {
+            return;
+          }
+          Effect.runFork(completePassiveTurn(ctx));
+        }, passiveTurnIdleMs);
+        ctx.passiveTurn = { turnId, timerHandle };
+      });
 
     const getThreadSemaphore = (threadId: string) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
@@ -689,6 +772,8 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        // A still-open passive turn must not outlive the session.
+        yield* completePassiveTurn(ctx);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
@@ -984,6 +1069,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             activeTurnId: undefined,
             currentModelId,
             promptsInFlight: 0,
+            passiveTurn: undefined,
             stopped: false,
           };
 
@@ -1004,6 +1090,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     );
                     return;
                   case "AssistantItemStarted":
+                    yield* ensurePassiveTurn(ctx);
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
                         stamp: yield* makeEventStamp(),
@@ -1016,6 +1103,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     );
                     return;
                   case "AssistantItemCompleted":
+                    yield* ensurePassiveTurn(ctx);
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
                         stamp: yield* makeEventStamp(),
@@ -1032,6 +1120,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     yield* emitPlanUpdate(ctx, event.payload, event.rawPayload);
                     return;
                   case "ToolCallUpdated":
+                    yield* ensurePassiveTurn(ctx);
                     yield* logNative(ctx.threadId, "session/update", event.rawPayload);
                     yield* offerRuntimeEvent(
                       makeKimiToolCallEvent({
@@ -1044,6 +1133,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     );
                     return;
                   case "ThoughtDelta":
+                    yield* ensurePassiveTurn(ctx);
                     yield* logNative(ctx.threadId, "session/update", event.rawPayload);
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
@@ -1058,6 +1148,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     );
                     return;
                   case "ContentDelta":
+                    yield* ensurePassiveTurn(ctx);
                     yield* logNative(ctx.threadId, "session/update", event.rawPayload);
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
@@ -1120,6 +1211,10 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
     const sendTurn: KimiAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+        // A passive burst still open (cron fire, background-agent report)
+        // ends here: the user's prompt starts a real turn that must not be
+        // merged into provider-initiated work.
+        yield* completePassiveTurn(ctx);
         // Admission runs synchronously before any async setup so a concurrent
         // sendTurn observes this turn through `activeTurnId`, not just the
         // pre-claim `promptsInFlight` count. Without claiming the active turn
@@ -1305,6 +1400,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
     const interruptTurn: KimiAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        yield* completePassiveTurn(ctx);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         yield* Effect.ignore(
