@@ -345,15 +345,14 @@ export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(functi
     [],
   );
   const getSnapshot = Effect.all([provider.getSnapshot, SubscriptionRef.get(workspaces)]).pipe(
-    Effect.map(([snapshot, workspaceSnapshots]) =>
-      workspaceSnapshots.length > 0
-        ? {
-            ...snapshot,
-            workspaceSnapshots,
-            slashCommands: mergeKimiSyntheticCommands(snapshot.slashCommands ?? []),
-          }
-        : { ...snapshot, slashCommands: mergeKimiSyntheticCommands(snapshot.slashCommands ?? []) },
-    ),
+    Effect.map(([snapshot, workspaceSnapshots]) => ({
+      ...snapshot,
+      workspaceSnapshots: workspaceSnapshots.map((entry) => ({
+        ...entry,
+        slashCommands: mergeKimiSyntheticCommands(entry.slashCommands ?? []),
+      })),
+      slashCommands: mergeKimiSyntheticCommands(snapshot.slashCommands ?? []),
+    })),
   );
   const snapshotForCwd = Effect.fn("KimiCommandCatalog.snapshotForCwd")(function* (cwd: string) {
     const machineSnapshot = yield* provider.getSnapshot;
@@ -364,9 +363,11 @@ export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(functi
         {
           cwd,
           checkedAt,
-          slashCommands:
+          slashCommands: mergeKimiSyntheticCommands(
             entries.find((entry) => entry.cwd === cwd)?.slashCommands ??
-            machineSnapshot.slashCommands,
+              machineSnapshot.slashCommands ??
+              [],
+          ),
           skills: entries.find((entry) => entry.cwd === cwd)?.skills ?? machineSnapshot.skills,
         },
       ].slice(-16),

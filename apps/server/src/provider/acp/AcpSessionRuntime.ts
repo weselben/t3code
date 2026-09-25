@@ -974,10 +974,14 @@ export const make = (
       yield* Effect.raceFirst(Deferred.await(acknowledge), Deferred.await(runtimeClosed));
     });
 
-    const sealPassiveBurst = Effect.gen(function* () {
-      yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
-      yield* Ref.set(assistantUpdatesOpenRef, false);
-    });
+    // Serialize with incoming notifications so a chunk cannot re-open the
+    // assistant segment between the close and the flag flip.
+    const sealPassiveBurst = notificationSemaphore.withPermit(
+      Effect.gen(function* () {
+        yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
+        yield* Ref.set(assistantUpdatesOpenRef, false);
+      }),
+    );
 
     const retireRuntime = Effect.fn("AcpSessionRuntime.retireRuntime")(function* (
       error: EffectAcpErrors.AcpError,

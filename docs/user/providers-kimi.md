@@ -30,8 +30,8 @@ runs.
 - **Sub-agents.** When Kimi dispatches an `Agent` or an `AgentSwarm`, the thread shows a spawn
   row. Kimi keeps sub-agent work isolated, so you see the dispatch and the final result, not the
   inner tool calls.
-- **Background updates.** Cron reminders and background agents report back into the thread as
-  agent messages, so you see their results without asking.
+- **Background updates.** When Kimi reports background work back into the session, the thread
+  shows it as an agent message, so you see the result without asking.
 - **Questions.** When Kimi asks you a question or requests a tool approval, the thread shows the
   same question panel and approval controls as other providers.
 
@@ -47,6 +47,7 @@ the Kimi terminal and are not available here.
 
 ## Known limits
 
+- Cron reminders fire inside Kimi, but their output does not appear in the thread yet.
 - Kimi has no separate "accept edits" permission level. The approval modes map to Kimi's
   Default, Auto, and YOLO modes.
 - Updates are manual: run `kimi upgrade` on the server machine.

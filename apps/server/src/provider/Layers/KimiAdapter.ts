@@ -12,7 +12,6 @@ import {
   type ProviderInteractionMode,
   type ProviderRuntimeEvent,
   type ProviderSession,
-  type ProviderUserInputAnswers,
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
@@ -71,16 +70,10 @@ import {
   currentKimiModelIdFromSessionSetup,
   findKimiPlanMode,
   isKimiAlreadyInPlanModeError,
-  isKimiCronToolTitle,
   makeKimiAcpRuntime,
   matchKimiSyntheticPrompt,
   resolveKimiAcpBaseModelId,
   resolveRequestedKimiModeId,
-  buildKimiCronFireEnvelope,
-  nextKimiCronFire,
-  parseKimiCronCreateArgs,
-  parseKimiCronCreateResult,
-  type KimiCronCreateArgs,
   type KimiSyntheticPrompt,
 } from "../acp/KimiAcpSupport.ts";
 import { type KimiAdapterShape } from "../Services/KimiAdapter.ts";
@@ -91,11 +84,6 @@ const PROVIDER = ProviderDriverKind.make("kimi");
 
 /** How long a provider-initiated turn stays open after its last passive event. */
 const KIMI_PASSIVE_TURN_IDLE_MS_DEFAULT = 10_000;
-/**
- * Mirrored cron fires land this long after Kimi's own (invisible) fire so the
- * harness copy settles first and the mirrored turn is the one the user reads.
- */
-const KIMI_CRON_MIRROR_DELAY_MS_DEFAULT = 10_000;
 const KIMI_RESUME_VERSION = 1 as const;
 
 /** Serializes diagnostic payloads when they are representable as JSON. */
@@ -122,11 +110,6 @@ export interface KimiAdapterLiveOptions {
    * passive event. Tests shrink this; production keeps the default.
    */
   readonly passiveTurnIdleMs?: number;
-  /**
-   * Extra delay between Kimi's own cron fire and the mirrored visible turn.
-   * Tests shrink this; production keeps the default.
-   */
-  readonly cronMirrorDelayMs?: number;
   /**
    * Optional per-session settings resolver. When provided the adapter yields
    * this effect at the start of every session and uses the result instead of
@@ -169,17 +152,6 @@ interface PendingUserInput {
   readonly requestedSchema: FormElicitationRequest["requestedSchema"];
 }
 
-interface KimiCronMirrorEntry {
-  readonly jobId: string;
-  readonly cron: string;
-  readonly prompt: string;
-  readonly recurring: boolean;
-  /** Mutable: a fire that lands mid-turn defers itself to "now" so the
-   * next settle picks it up instead of firing inside an active turn. */
-  fireAtMs: number;
-  timerHandle: NodeJS.Timeout | undefined;
-}
-
 interface KimiSessionContext {
   readonly threadId: ThreadId;
   session: ProviderSession;
@@ -208,11 +180,6 @@ interface KimiSessionContext {
         timerHandle: NodeJS.Timeout | undefined;
       }
     | undefined;
-  /** Mirrored kimi cron registrations, re-fired as visible client turns
-   * delayed past kimi's own (invisible) harness fire. */
-  readonly cronMirrors: Map<string, KimiCronMirrorEntry>;
-  /** Streamed CronCreate args awaiting the completed tool call result. */
-  readonly pendingCronArgs: Map<string, KimiCronCreateArgs>;
   stopped: boolean;
 }
 
@@ -706,7 +673,6 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
   return Effect.gen(function* () {
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("kimi");
     const passiveTurnIdleMs = options?.passiveTurnIdleMs ?? KIMI_PASSIVE_TURN_IDLE_MS_DEFAULT;
-    const cronMirrorDelayMs = options?.cronMirrorDelayMs ?? KIMI_CRON_MIRROR_DELAY_MS_DEFAULT;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -940,183 +906,12 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
       return Effect.succeed(ctx);
     };
 
-    /** Fires one cron mirror as a visible client turn; recurring entries
-     * reschedule, one-shot entries vanish. */
-    const fireCronMirror = (ctx: KimiSessionContext, jobId: string): void => {
-      const current = ctx.cronMirrors.get(jobId);
-      if (current === undefined || ctx.stopped) {
-        return;
-      }
-      if (current.timerHandle !== undefined) {
-        clearTimeout(current.timerHandle);
-      }
-      if (current.recurring) {
-        // @effect-diagnostics-next-line globalDate:off
-        const next = nextKimiCronFire(current.cron, new Date());
-        if (next !== undefined) {
-          setCronMirrorTimer(ctx, { ...current, fireAtMs: next.getTime() + cronMirrorDelayMs });
-        } else {
-          ctx.cronMirrors.delete(jobId);
-        }
-      } else {
-        ctx.cronMirrors.delete(jobId);
-      }
-      // The mirrored fire is a client-initiated prompt: it streams back
-      // like any normal turn, so every client sees the cron answer.
-      Effect.runFork(
-        sendTurn({
-          threadId: ctx.threadId,
-          input: buildKimiCronFireEnvelope({
-            jobId,
-            cron: current.cron,
-            prompt: current.prompt,
-            recurring: current.recurring,
-          }),
-          attachments: [],
-        }).pipe(
-          Effect.tapError((error) => Effect.logError("Kimi cron mirror turn failed.", { error })),
-          Effect.ignore,
-        ),
-      );
-    };
-
-    const setCronMirrorTimer = (
-      ctx: KimiSessionContext,
-      entry: {
-        readonly jobId: string;
-        readonly cron: string;
-        readonly prompt: string;
-        readonly recurring: boolean;
-        fireAtMs: number;
-      },
-    ): void => {
-      const existing = ctx.cronMirrors.get(entry.jobId);
-      if (existing !== undefined) {
-        clearTimeout(existing.timerHandle);
-      }
-      // @effect-diagnostics-next-line globalTimers:off
-      const timerHandle = setTimeout(
-        () => {
-          const current = ctx.cronMirrors.get(entry.jobId);
-          if (current === undefined || ctx.stopped) {
-            return;
-          }
-          // Never fire mid-turn: defer to "now" and let the next settle
-          // re-scan the mirror map and pick it up.
-          if (ctx.promptsInFlight > 0) {
-            // @effect-diagnostics-next-line globalDate:off
-            current.fireAtMs = Date.now();
-            return;
-          }
-          fireCronMirror(ctx, entry.jobId);
-          // @effect-diagnostics-next-line globalDate:off
-        },
-        Math.max(0, entry.fireAtMs - Date.now()),
-      );
-      ctx.cronMirrors.set(entry.jobId, {
-        jobId: entry.jobId,
-        cron: entry.cron,
-        prompt: entry.prompt,
-        recurring: entry.recurring,
-        fireAtMs: entry.fireAtMs,
-        timerHandle,
-      });
-    };
-
-    const cancelCronMirror = (ctx: KimiSessionContext, jobId: string): void => {
-      const existing = ctx.cronMirrors.get(jobId);
-      if (existing !== undefined) {
-        clearTimeout(existing.timerHandle);
-        ctx.cronMirrors.delete(jobId);
-      }
-    };
-
-    /**
-     * Mirrors Kimi's cron scheduler: CronCreate/CronDelete tool calls are
-     * visible here, so the adapter records the schedule and fires its own
-     * visible copy (delayed past Kimi's invisible harness fire). CronUpdate
-     * is not mirrored — Kimi reschedules internally and the mirror would
-     * only guess at the new shape.
-     */
-    const trackKimiCronToolCall = (
-      ctx: KimiSessionContext,
-      toolCall: AcpToolCallState,
-      rawPayload: unknown,
-    ) =>
-      Effect.gen(function* () {
-        // The notification payload nests the update fields one level down:
-        // `{ sessionId, update: { toolCallId, title?, status, ... } }`.
-        const payload = isRecord(rawPayload) ? rawPayload : {};
-        const rawUpdate = (isRecord(payload.update) ? payload.update : {}) as {
-          toolCallId?: string;
-          status?: string;
-          rawInput?: unknown;
-          content?: ReadonlyArray<{ content?: { text?: string } }>;
-        };
-        const title = toolCall.title;
-        const toolCallId = rawUpdate.toolCallId ?? toolCall.toolCallId;
-        const status = rawUpdate.status ?? toolCall.status;
-        // Real Kimi drifts the tool title across the lifecycle (pending is
-        // "CronCreate", in-progress renames to "Scheduling one-shot ...",
-        // completion carries no title), so tracking keys on the tool call id
-        // once the call is known — and a CronCreate-shaped rawInput is an
-        // entry ticket on its own.
-        const streamedArgs = parseKimiCronCreateArgs(rawUpdate.rawInput);
-        if (streamedArgs !== undefined) {
-          ctx.pendingCronArgs.set(toolCallId, streamedArgs);
-        }
-        const tracked = ctx.pendingCronArgs.has(toolCallId);
-        const isCronCall = tracked || isKimiCronToolTitle(title);
-        if (!isCronCall) {
-          return;
-        }
-        if (title === "CronDelete") {
-          const raw = rawUpdate.rawInput;
-          if (
-            typeof raw === "object" &&
-            raw !== null &&
-            typeof (raw as Record<string, unknown>).jobId === "string"
-          ) {
-            cancelCronMirror(ctx, (raw as Record<string, unknown>).jobId as string);
-          }
-          return;
-        }
-        if (status !== "completed") {
-          return;
-        }
-        const registeredArgs = ctx.pendingCronArgs.get(toolCallId);
-        ctx.pendingCronArgs.delete(toolCallId);
-        if (registeredArgs === undefined) {
-          return;
-        }
-        const contentText = (rawUpdate.content ?? [])
-          .map((block) => block.content?.text ?? "")
-          .join("");
-        const result = parseKimiCronCreateResult(contentText);
-        const jobId = result.jobId ?? toolCallId;
-        const nextFireAtMs =
-          result.nextFireAt?.getTime() ??
-          DateTime.toEpochMillis(yield* DateTime.now) + cronMirrorDelayMs;
-        setCronMirrorTimer(ctx, {
-          jobId,
-          cron: result.cron ?? registeredArgs.cron,
-          prompt: registeredArgs.prompt,
-          recurring: result.recurring,
-          fireAtMs: nextFireAtMs + cronMirrorDelayMs,
-        });
-      });
-
     const stopSessionInternal = (ctx: KimiSessionContext) =>
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
         // A still-open passive turn must not outlive the session.
         yield* completePassiveTurn(ctx);
-        for (const mirror of ctx.cronMirrors.values()) {
-          clearTimeout(mirror.timerHandle);
-        }
-        ctx.cronMirrors.clear();
-        ctx.pendingCronArgs.clear();
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
@@ -1414,8 +1209,6 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             promptsInFlight: 0,
             planRestoreModeId: undefined,
             passiveTurn: undefined,
-            cronMirrors: new Map(),
-            pendingCronArgs: new Map(),
             stopped: false,
           };
 
@@ -1467,7 +1260,6 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     return;
                   case "ToolCallUpdated":
                     yield* ensurePassiveTurn(ctx);
-                    yield* trackKimiCronToolCall(ctx, event.toolCall, event.rawPayload);
                     yield* logNative(ctx.threadId, "session/update", event.rawPayload);
                     yield* offerRuntimeEvent(
                       makeKimiToolCallEvent({
@@ -1558,6 +1350,19 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
     const sendTurn: KimiAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+        // Reject argumentless synthetic commands before any turn setup so a
+        // usage error never emits turn.started or touches the session mode.
+        const earlySynthetic = matchKimiSyntheticPrompt(input.input?.trim() ?? "");
+        if (earlySynthetic !== undefined && !earlySynthetic.args) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue:
+              earlySynthetic.command === "plan"
+                ? "Usage: /plan <what to plan> — the request runs in Kimi's plan mode for this turn only."
+                : "Usage: /goal <objective> — optionally include a completion criterion.",
+          });
+        }
         // A passive burst still open (cron fire, background-agent report)
         // ends here: the user's prompt starts a real turn that must not be
         // merged into provider-initiated work.
@@ -1772,22 +1577,6 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                 } else {
                   yield* Effect.logError("Kimi /plan mode restore failed; will retry next turn.");
                 }
-              }
-              // Catch-up for cron mirrors whose timer fired mid-turn and
-              // deferred themselves: fire the earliest overdue mirror, one
-              // per settle, so later settles drain the rest.
-              const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-              let earliest: KimiCronMirrorEntry | undefined;
-              for (const mirror of ctx.cronMirrors.values()) {
-                if (mirror.fireAtMs > nowMs) {
-                  continue;
-                }
-                if (earliest === undefined || mirror.fireAtMs < earliest.fireAtMs) {
-                  earliest = mirror;
-                }
-              }
-              if (earliest !== undefined) {
-                fireCronMirror(ctx, earliest.jobId);
               }
             }),
           ),

@@ -251,7 +251,7 @@ it.layer(NodeServices.layer)("makeKimiCommandCatalog", (it) => {
       }),
   );
 
-  it("lets a native command win over a synthetic one with the same name", () =>
+  it.effect("lets a native command win over a synthetic one with the same name", () =>
     Effect.gen(function* () {
       const { onAvailableCommands, snapshotForCwd } = yield* makeKimiCommandCatalog(baseShape);
 
@@ -262,14 +262,15 @@ it.layer(NodeServices.layer)("makeKimiCommandCatalog", (it) => {
 
       const workspace = yield* snapshotForCwd("/workspace-native");
       expect(workspace.slashCommands).toEqual([
-        { name: "plan", description: "Kimi's own plan command" },
         {
           name: "goal",
           description: "Create a goal Kimi keeps working toward across turns.",
           input: { hint: "objective, optionally with a completion criterion" },
         },
+        { name: "plan", description: "Kimi's own plan command" },
       ]);
-    }));
+    }),
+  );
 
   it.effect("keeps synthetic commands in the stored workspace list without duplicating them", () =>
     Effect.gen(function* () {
