@@ -11,6 +11,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
@@ -49,7 +50,11 @@ async function makeMockAgentWrapper(extraEnv?: Record<string, string>) {
   });
 }
 
-async function makeProbeWrapper(requestLogPath: string, argvLogPath: string) {
+async function makeProbeWrapper(
+  requestLogPath: string,
+  argvLogPath: string,
+  extraEnv?: Record<string, string>,
+) {
   const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kimi-acp-probe-"));
   return writeFakeCli({
     directory: dir,
@@ -57,6 +62,7 @@ async function makeProbeWrapper(requestLogPath: string, argvLogPath: string) {
     env: {
       T3_ACP_KIMI: "1",
       T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+      ...extraEnv,
     },
     source: execScriptSource({
       scriptPath: mockAgentPath,
@@ -1288,8 +1294,19 @@ describe("KimiAdapterPassiveUpdates", () => {
       });
 
       const events: ProviderRuntimeEvent[] = [];
+      const passiveTurnClosed = yield* Deferred.make<void>();
+      let completedCount = 0;
       const drainFiber = yield* rawAdapter.streamEvents.pipe(
-        Stream.runForEach((event) => Effect.sync(() => events.push(event))),
+        Stream.runForEach((event) => {
+          events.push(event);
+          if (event.type !== "turn.completed") {
+            return Effect.void;
+          }
+          completedCount += 1;
+          return completedCount === 2
+            ? Deferred.succeed(passiveTurnClosed, undefined).pipe(Effect.ignore)
+            : Effect.void;
+        }),
         Effect.forkChild,
       );
 
@@ -1301,13 +1318,15 @@ describe("KimiAdapterPassiveUpdates", () => {
       });
       yield* rawAdapter.sendTurn({ threadId, input: "hello", attachments: [] });
 
-      // The passive chunk fires ~1.5s after the prompt started; the idle
-      // close follows 300ms after the burst.
-      yield* Effect.sleep(2500);
+      const closed = yield* Deferred.await(passiveTurnClosed).pipe(
+        Effect.timeoutOption("10 seconds"),
+      );
+      assert.ok(Option.isSome(closed), "expected the passive turn to close");
 
       const turnStarts = events.filter((event) => event.type === "turn.started");
       assert.equal(turnStarts.length, 2, "expected a real and a passive turn.started");
       const passiveTurn = turnStarts[1];
+      assert.ok(passiveTurn, "expected the passive turn.started");
 
       const passiveDelta = events.find(
         (event) =>
@@ -1327,6 +1346,109 @@ describe("KimiAdapterPassiveUpdates", () => {
       Effect.provide(
         ServerConfig.layerTest(process.cwd(), {
           prefix: "t3code-kimi-passive-test-",
+        }).pipe(Layer.provideMerge(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.live("mirrors kimi cron registrations as delayed visible turns", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kimi-cron-mirror-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kimi-acp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, NodePath.join(logDir, "argv.tsv"), {
+          T3_ACP_KIMI_EMIT_CRON_MIRROR: "1",
+        }),
+      );
+
+      const rawAdapter = yield* makeKimiAdapter(decodeKimiSettings({ binaryPath: wrapperPath }), {
+        cronMirrorDelayMs: 200,
+      });
+
+      const events: ProviderRuntimeEvent[] = [];
+      const mirrorTurnClosed = yield* Deferred.make<void>();
+      const followUpTurnClosed = yield* Deferred.make<void>();
+      let completedCount = 0;
+      const drainFiber = yield* rawAdapter.streamEvents.pipe(
+        Stream.runForEach((event) => {
+          events.push(event);
+          if (event.type !== "turn.completed") {
+            return Effect.void;
+          }
+          completedCount += 1;
+          if (completedCount === 2) {
+            return Deferred.succeed(mirrorTurnClosed, undefined).pipe(Effect.ignore);
+          }
+          return completedCount === 3
+            ? Deferred.succeed(followUpTurnClosed, undefined).pipe(Effect.ignore)
+            : Effect.void;
+        }),
+        Effect.forkChild,
+      );
+
+      yield* rawAdapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* rawAdapter.sendTurn({ threadId, input: "hello", attachments: [] });
+
+      // The mock registers nextFireAt one second out; the mirror fires 200ms
+      // after that.
+      const closed = yield* Deferred.await(mirrorTurnClosed).pipe(
+        Effect.timeoutOption("10 seconds"),
+      );
+      assert.ok(Option.isSome(closed), "expected the mirrored cron turn to close");
+
+      // One-shot registration: after the mirror fired, the entry is gone, so
+      // a follow-up turn must not produce another cron envelope prompt.
+      yield* rawAdapter.sendTurn({ threadId, input: "follow-up", attachments: [] });
+      const followUpClosed = yield* Deferred.await(followUpTurnClosed).pipe(
+        Effect.timeoutOption("10 seconds"),
+      );
+      assert.ok(Option.isSome(followUpClosed), "expected the follow-up turn to close");
+
+      yield* Fiber.interrupt(drainFiber);
+      yield* rawAdapter.stopSession(threadId);
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const prompts = requests.filter((request) => request.method === "session/prompt");
+      assert.equal(prompts.length, 3, "expected hello, mirrored fire, and follow-up prompts");
+      const promptTexts = prompts.map(
+        (request) =>
+          (
+            (request.params as Record<string, unknown>).prompt as Array<{
+              type: string;
+              text?: string;
+            }>
+          )[0]?.text ?? "",
+      );
+      const cronEnvelopes = promptTexts.filter((text) => text.startsWith("<cron-fire"));
+      assert.equal(cronEnvelopes.length, 1, "expected exactly one mirrored cron fire");
+      const mirrorText = cronEnvelopes[0] ?? "";
+      assert.ok(
+        mirrorText.startsWith('<cron-fire jobId="cron-mirror-1"'),
+        `unexpected mirror prompt: ${mirrorText}`,
+      );
+      assert.ok(mirrorText.includes("kimi cron mirror test"), mirrorText);
+
+      const turnStarts = events.filter((event) => event.type === "turn.started");
+      // A steer racing the mirror's settle can merge the follow-up into the
+      // same turn, so only completions are deterministic here.
+      assert.ok(
+        turnStarts.length === 2 || turnStarts.length === 3,
+        `expected the real, mirrored, and follow-up turns: ${turnStarts.length}`,
+      );
+      const turnCompletions = events.filter((event) => event.type === "turn.completed");
+      assert.equal(turnCompletions.length, 3, "expected every turn to close");
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3code-kimi-cron-mirror-test-",
         }).pipe(Layer.provideMerge(NodeServices.layer)),
       ),
     ),

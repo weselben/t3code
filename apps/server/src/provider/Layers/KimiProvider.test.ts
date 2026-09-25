@@ -270,4 +270,33 @@ it.layer(NodeServices.layer)("makeKimiCommandCatalog", (it) => {
         },
       ]);
     }));
+
+  it.effect("keeps synthetic commands in the stored workspace list without duplicating them", () =>
+    Effect.gen(function* () {
+      const { onAvailableCommands, snapshotForCwd } = yield* makeKimiCommandCatalog(baseShape);
+
+      yield* onAvailableCommands(
+        [{ name: "compact", description: "Compact the conversation" }],
+        "/workspace-synthetic",
+      );
+
+      const first = yield* snapshotForCwd("/workspace-synthetic");
+      const syntheticNames = KIMI_SYNTHETIC_COMMANDS.map((definition) => definition.command);
+      expect(first.slashCommands.map((command) => command.name)).toEqual([
+        ...syntheticNames,
+        "compact",
+      ]);
+      expect(
+        first.workspaceSnapshots
+          ?.find((entry) => entry.cwd === "/workspace-synthetic")
+          ?.slashCommands.map((command) => command.name),
+      ).toEqual([...syntheticNames, "compact"]);
+
+      const second = yield* snapshotForCwd("/workspace-synthetic");
+      expect(second.slashCommands.map((command) => command.name)).toEqual([
+        ...syntheticNames,
+        "compact",
+      ]);
+    }),
+  );
 });

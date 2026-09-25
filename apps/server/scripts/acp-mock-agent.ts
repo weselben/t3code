@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics globalDateInEffect:off
 import * as NodeFS from "node:fs";
 
 import * as Effect from "effect/Effect";
@@ -18,6 +19,7 @@ const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const kimiProfile = process.env.T3_ACP_KIMI === "1";
 const emitKimiSubagentToolCalls = process.env.T3_ACP_KIMI_EMIT_SUBAGENT_TOOL_CALLS === "1";
 const emitKimiPassiveChunk = process.env.T3_ACP_KIMI_EMIT_PASSIVE_CHUNK === "1";
+const emitKimiCronMirror = process.env.T3_ACP_KIMI_EMIT_CRON_MIRROR === "1";
 const emitKimiElicitationMode = process.env.T3_ACP_KIMI_EMIT_ELICIT;
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitInterleavedAssistantToolCalls =
@@ -740,6 +742,47 @@ const program = Effect.gen(function* () {
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
+      if (emitKimiCronMirror) {
+        // CronCreate lifecycle mirroring REAL kimi: pending with the
+        // CronCreate title, in-progress renames the title and carries the
+        // parsed rawInput, completion drops the title entirely. The client
+        // mirrors the fire from `nextFireAt`.
+        const cronToolCallId = "0:tool_cron_mirror";
+        const nextFireAt = new Date(Date.now() + 1000).toISOString();
+        const emit = (update: Record<string, unknown>) => {
+          writeJsonRpcNotification("session/update", {
+            sessionId: requestedSessionId,
+            update: { toolCallId: cronToolCallId, kind: "other", ...update },
+          });
+        };
+        emit({
+          sessionUpdate: "tool_call",
+          title: "CronCreate",
+          status: "pending",
+          content: [{ type: "content", content: { type: "text", text: "" } }],
+        });
+        emit({
+          sessionUpdate: "tool_call_update",
+          title: "Scheduling one-shot * * * * *",
+          status: "in_progress",
+          rawInput: { cron: "* * * * *", prompt: "kimi cron mirror test", recurring: false },
+          content: [{ type: "content", content: { type: "text", text: '{"cron":"* * * * *"}' } }],
+        });
+        emit({
+          sessionUpdate: "tool_call_update",
+          status: "completed",
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: `id: cron-mirror-1\ncron: * * * * *\nrecurring: false\nnextFireAt: ${nextFireAt}`,
+              },
+            },
+          ],
+        });
+      }
+
       if (emitKimiPassiveChunk) {
         // Harness-initiated output: fires long after the prompt response has
         // been written, so only a runtime passing passive updates through

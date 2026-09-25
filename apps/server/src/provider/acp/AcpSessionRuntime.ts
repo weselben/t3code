@@ -235,6 +235,8 @@ export class AcpSessionRuntime extends Context.Service<
     readonly getEvents: () => Stream.Stream<AcpSessionRuntimeEvent, never>;
     /** Waits for queued events to be processed, or for the runtime scope to close. */
     readonly drainEvents: Effect.Effect<void>;
+    /** Closes the open assistant segment and resets the passive-update gate; used by adapters after a provider-initiated burst completes. */
+    readonly sealPassiveBurst: Effect.Effect<void>;
     /** Latest mode state observed from session setup and `session/update` notifications. */
     readonly getModeState: Effect.Effect<AcpSessionModeState | undefined>;
     /** Latest configuration options observed from session setup and configuration writes. */
@@ -972,6 +974,11 @@ export const make = (
       yield* Effect.raceFirst(Deferred.await(acknowledge), Deferred.await(runtimeClosed));
     });
 
+    const sealPassiveBurst = Effect.gen(function* () {
+      yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
+      yield* Ref.set(assistantUpdatesOpenRef, false);
+    });
+
     const retireRuntime = Effect.fn("AcpSessionRuntime.retireRuntime")(function* (
       error: EffectAcpErrors.AcpError,
     ) {
@@ -1038,6 +1045,7 @@ export const make = (
       start: () => start,
       getEvents: () => Stream.fromQueue(eventQueue),
       drainEvents,
+      sealPassiveBurst: sealPassiveBurst,
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
       prompt: (payload, promptOptions?) =>

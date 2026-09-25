@@ -403,9 +403,7 @@ export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(functi
         },
       ];
     });
-    // Native list verbatim, minus malformed rows. The synthetic commands are
-    // merged where snapshots are served (see mergeKimiSyntheticCommands).
-    const slashCommands = nativeSlashCommands;
+    const slashCommands = mergeKimiSyntheticCommands(nativeSlashCommands);
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
     yield* SubscriptionRef.update(workspaces, (entries) =>
       [

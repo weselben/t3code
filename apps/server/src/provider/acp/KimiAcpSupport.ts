@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics globalDate:off
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import {
@@ -351,4 +352,157 @@ export function matchKimiSyntheticPrompt(rawPrompt: string): KimiSyntheticPrompt
  */
 export function buildKimiGoalPrompt(args: string): string {
   return `/write-goal ${args}`;
+}
+
+/** True when a tool_call notification belongs to Kimi's cron scheduler. */
+export function isKimiCronToolTitle(title: string | undefined | null): boolean {
+  return title === "CronCreate" || title === "CronDelete" || title === "CronUpdate";
+}
+
+export interface KimiCronCreateArgs {
+  readonly cron: string;
+  readonly prompt: string;
+  readonly recurring: boolean;
+}
+
+/** Parses the streamed `rawInput` of a Kimi CronCreate tool call. */
+export function parseKimiCronCreateArgs(raw: unknown): KimiCronCreateArgs | undefined {
+  if (typeof raw !== "object" || raw === null) {
+    return undefined;
+  }
+  const record = raw as Record<string, unknown>;
+  if (typeof record.cron !== "string" || typeof record.prompt !== "string") {
+    return undefined;
+  }
+  return { cron: record.cron, prompt: record.prompt, recurring: record.recurring === true };
+}
+
+export interface KimiCronCreateResult {
+  readonly jobId: string | undefined;
+  readonly cron: string | undefined;
+  readonly recurring: boolean;
+  readonly nextFireAt: Date | undefined;
+}
+
+/** Parses the `key: value` result block of a completed Kimi CronCreate call. */
+export function parseKimiCronCreateResult(contentText: string): KimiCronCreateResult {
+  const result: { jobId?: string; cron?: string; recurring?: boolean; nextFireAt?: Date } = {
+    recurring: false,
+  };
+  for (const line of contentText.split("\n")) {
+    const match = /^([a-zA-Z]+):\s*(.+)$/.exec(line.trim());
+    if (!match) {
+      continue;
+    }
+    const [, key, value] = match;
+    if (key === undefined || value === undefined) {
+      continue;
+    }
+    if (key === "id") {
+      result.jobId = value;
+    } else if (key === "cron") {
+      result.cron = value;
+    } else if (key === "recurring") {
+      result.recurring = value === "true";
+    } else if (key === "nextFireAt") {
+      const parsed = new Date(value);
+      if (!Number.isNaN(parsed.getTime())) {
+        result.nextFireAt = parsed;
+      }
+    }
+  }
+  return result as KimiCronCreateResult;
+}
+
+/**
+ * Rebuilds the `<cron-fire>` envelope Kimi's TUI delivers when a cron fires.
+ * The mirrored fire reuses the exact format so the agent sees a familiar
+ * prompt.
+ */
+export function buildKimiCronFireEnvelope(input: {
+  readonly jobId: string;
+  readonly cron: string;
+  readonly prompt: string;
+  readonly recurring: boolean;
+}): string {
+  return [
+    `<cron-fire jobId="${input.jobId}" cron="${input.cron}" recurring="${input.recurring}" coalescedCount="1" stale="false">`,
+    "<prompt>",
+    input.prompt,
+    "</prompt>",
+    "</cron-fire>",
+  ].join("\n");
+}
+
+function parseKimiCronField(field: string): ((value: number) => boolean) | undefined {
+  if (field === "*") {
+    return () => true;
+  }
+  const stepMatch = /^\*\/(\d+)$/.exec(field);
+  if (stepMatch) {
+    const step = Number(stepMatch[1]);
+    if (step <= 0) {
+      return undefined;
+    }
+    return (value) => value % step === 0;
+  }
+  const values = new Set<number>();
+  for (const part of field.split(",")) {
+    const range = /^(\d+)-(\d+)$/.exec(part);
+    if (range) {
+      const low = Number(range[1]);
+      const high = Number(range[2]);
+      if (high < low) {
+        return undefined;
+      }
+      for (let value = low; value <= high; value++) {
+        values.add(value);
+      }
+      continue;
+    }
+    if (!/^\d+$/.test(part)) {
+      return undefined;
+    }
+    values.add(Number(part));
+  }
+  return (value) => values.has(value);
+}
+
+/**
+ * Computes the next fire time of a 5-field cron expression (minute hour
+ * day-of-month month day-of-week, local time) after `after`. Restricted
+ * day-of-month and day-of-week follow standard cron's OR semantics.
+ */
+export function nextKimiCronFire(cron: string, after: Date): Date | undefined {
+  const fields = cron.trim().split(/\s+/);
+  if (fields.length !== 5) {
+    return undefined;
+  }
+  const minute = parseKimiCronField(fields[0]!);
+  const hour = parseKimiCronField(fields[1]!);
+  const dayOfMonth = parseKimiCronField(fields[2]!);
+  const month = parseKimiCronField(fields[3]!);
+  const dayOfWeek = parseKimiCronField(fields[4]!);
+  if (!minute || !hour || !dayOfMonth || !month || !dayOfWeek) {
+    return undefined;
+  }
+  const cursor = new Date(after.getTime());
+  cursor.setSeconds(0, 0);
+  for (let step = 0; step < 366 * 24 * 60; step++) {
+    cursor.setMinutes(cursor.getMinutes() + 1);
+    if (!month(cursor.getMonth() + 1) || !hour(cursor.getHours()) || !minute(cursor.getMinutes())) {
+      continue;
+    }
+    const domRestricted = fields[2] !== "*";
+    const dowRestricted = fields[4] !== "*";
+    const dayOk =
+      domRestricted && dowRestricted
+        ? dayOfMonth(cursor.getDate()) || dayOfWeek(cursor.getDay())
+        : dayOfMonth(cursor.getDate()) && dayOfWeek(cursor.getDay());
+    if (!dayOk) {
+      continue;
+    }
+    return new Date(cursor.getTime());
+  }
+  return undefined;
 }

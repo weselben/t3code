@@ -30,27 +30,23 @@ runs.
 - **Sub-agents.** When Kimi dispatches an `Agent` or an `AgentSwarm`, the thread shows a spawn
   row. Kimi keeps sub-agent work isolated, so you see the dispatch and the final result, not the
   inner tool calls.
-- **Background updates.** Kimi-side work that runs on its own — cron reminders, background
-  agents returning — reports back into the thread as a provider-initiated turn, the same way a
-  message from the agent would appear.
+- **Background updates.** Cron reminders and background agents report back into the thread as
+  agent messages, so you see their results without asking.
 - **Questions.** When Kimi asks you a question or requests a tool approval, the thread shows the
   same question panel and approval controls as other providers.
 
 ## Commands
 
-Type `/` in the composer to see Kimi's remote commands, for example `/compact`, `/status`,
-`/usage`, `/tasks`, and your Kimi skills. Commands that only make sense inside the Kimi terminal
-UI, such as `/theme` and `/swarm`, are not offered.
+Type `/` in the composer to see Kimi's commands — for example `/compact`, `/status`, `/usage`,
+`/tasks`, and your Kimi skills.
+
+**Synthetic commands.** `/plan <task>` plans the task read-only for that turn. The thread returns
+to its previous mode afterwards; use the thread's Plan/Build toggle to plan across several turns.
+`/goal <objective>` starts a goal Kimi keeps working toward. `/swarm` and `/theme` only exist in
+the Kimi terminal and are not available here.
 
 ## Known limits
 
-- Kimi's `/plan` and `/goal` commands work here as T3-side additions, because Kimi's ACP server
-  rejects the TUI's message commands. `/plan <task>` runs the request in Kimi's native plan mode
-  for that single turn and restores the thread's approval mode afterwards; the thread's
-  Plan/Build toggle stays the way to plan across several turns. `/goal <objective>` maps onto
-  Kimi's own `write-goal` command — the same flow Kimi's TUI uses to turn a prompt into a goal.
-  Kimi's `/swarm` and `/theme` stay terminal-only: `/swarm` has no ACP surface, so it is not
-  approximated.
 - Kimi has no separate "accept edits" permission level. The approval modes map to Kimi's
   Default, Auto, and YOLO modes.
 - Updates are manual: run `kimi upgrade` on the server machine.
