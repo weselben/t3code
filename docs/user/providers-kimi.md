@@ -28,8 +28,9 @@ runs.
   takes effect without a restart.
 - **Plan mode.** Use the thread's Plan/Build toggle. Plan maps to Kimi's read-only Plan mode.
 - **Sub-agents.** When Kimi dispatches an `Agent` or an `AgentSwarm`, the thread shows a spawn
-  row. Kimi keeps sub-agent work isolated, so you see the dispatch and the final result, not the
-  inner tool calls.
+  row with its running and finished state, and the dispatch appears in the Agents panel with its
+  start and end status. Kimi keeps sub-agent work isolated, so you see the dispatch and the final
+  result, not the inner tool calls.
 - **Background updates.** When Kimi reports background work back into the session, the thread
   shows it as an agent message, so you see the result without asking.
 - **Questions.** When Kimi asks you a question or requests a tool approval, the thread shows the

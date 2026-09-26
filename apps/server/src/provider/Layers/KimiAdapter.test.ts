@@ -204,15 +204,98 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
             : []
           : [],
       );
+      // The Agent call runs pending → in_progress → completed; pending and
+      // in-progress both display as "inProgress" in item rows. AgentSwarm
+      // arrives already completed.
       assert.deepStrictEqual(
-        subagentRows.map((payload) => [payload.title, payload.status]).toSorted(),
+        subagentRows.map((payload) => [payload.title, payload.status]),
         [
-          ["Agent swarm", "completed"],
+          ["Subagent", "inProgress"],
+          ["Subagent", "inProgress"],
           ["Subagent", "completed"],
+          ["Agent swarm", "completed"],
+        ],
+      );
+
+      const taskStarted = runtimeEvents.flatMap((event) =>
+        event.type === "task.started" ? [event.payload] : [],
+      );
+      assert.deepStrictEqual(
+        taskStarted.map((payload) => [
+          payload.taskId,
+          payload.taskType,
+          payload.toolUseId,
+          payload.description ?? null,
+        ]),
+        [
+          ["0:tool_agent_1", "subagent", "0:tool_agent_1", "review config tests"],
+          ["0:tool_swarm_1", "subagent_batch", "0:tool_swarm_1", null],
+        ],
+      );
+
+      const taskCompleted = runtimeEvents.flatMap((event) =>
+        event.type === "task.completed" ? [event.payload] : [],
+      );
+      assert.deepStrictEqual(
+        taskCompleted.map((payload) => [payload.taskId, payload.status, payload.summary ?? null]),
+        [
+          ["0:tool_agent_1", "completed", "agent_id: agent-123 finished review"],
+          [
+            "0:tool_swarm_1",
+            "completed",
+            '<agent_swarm_result><summary>2 agents</summary><subagent agent_id="agent-1" item="review" outcome="done">ok</subagent></agent_swarm_result>',
+          ],
         ],
       );
 
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("settles open subagent dispatches when the session stops", () =>
+    Effect.gen(function* () {
+      const adapter = yield* KimiAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("kimi-subagent-stop-thread");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_KIMI_EMIT_SUBAGENT_TOOL_CALLS: "1",
+          T3_ACP_KIMI_SUBAGENT_LEAVE_OPEN: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event: ProviderRuntimeEvent) => event.type === "session.exited",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      yield* adapter.sendTurn({ threadId, input: "dispatch agents", attachments: [] });
+      // The mock leaves the Agent dispatch in_progress forever; stopping the
+      // session must settle it as stopped.
+      yield* adapter.stopSession(threadId);
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+
+      const agentTask = runtimeEvents.flatMap((event) =>
+        event.type === "task.completed" && event.payload.taskId === "0:tool_agent_1"
+          ? [event.payload.status]
+          : [],
+      );
+      assert.deepStrictEqual(agentTask, ["stopped"]);
+      const swarmTask = runtimeEvents.flatMap((event) =>
+        event.type === "task.completed" && event.payload.taskId === "0:tool_swarm_1"
+          ? [event.payload.status]
+          : [],
+      );
+      assert.deepStrictEqual(swarmTask, ["completed"]);
     }),
   );
 

@@ -15,6 +15,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
+  RuntimeTaskId,
   type RuntimeMode,
   type ThreadId,
   TurnId,
@@ -180,6 +181,16 @@ interface KimiSessionContext {
         timerHandle: NodeJS.Timeout | undefined;
       }
     | undefined;
+  /** Open subagent dispatches (`Agent`/`AgentSwarm` tool calls) keyed by ACP
+   * tool-call id. Tracking keys on the id because Kimi drifts or drops tool
+   * titles across the lifecycle; the entry keeps the linkage emitted on
+   * task.completed and the display title for late, title-less item rows.
+   * `finished` marks ids whose terminal event already went out, so repeated
+   * completed updates cannot re-open or duplicate a task. */
+  readonly subagentTasks: Map<
+    string,
+    { readonly taskType: "subagent" | "subagent_batch"; readonly title: string; finished: boolean }
+  >;
   stopped: boolean;
 }
 
@@ -634,6 +645,10 @@ function makeKimiToolCallEvent(input: {
   readonly turnId: TurnId | undefined;
   readonly toolCall: AcpToolCallState;
   readonly rawPayload: unknown;
+  /** Display label already tracked for this tool-call id, used when the
+   * raw notification dropped the title (Kimi drifts titles across the
+   * lifecycle and emits generic "Tool" states for late updates). */
+  readonly subagentTitle?: string | undefined;
 }): ProviderRuntimeEvent {
   const event = makeAcpToolCallEvent({
     stamp: input.stamp,
@@ -648,10 +663,10 @@ function makeKimiToolCallEvent(input: {
   }
   // The parsed state carries a presentation summary (e.g. Kimi's `Agent`
   // dispatch with kind `read` becomes "Read file"), so the dispatch name is
-  // read back from the raw notification.
+  // read back from the raw notification; the tracked entry is the fallback.
   const update = isRecord(input.rawPayload) ? input.rawPayload.update : undefined;
   const rawTitle = isRecord(update) && typeof update.title === "string" ? update.title : undefined;
-  const subagentLabel = classifyKimiSubagentLabel(rawTitle);
+  const subagentLabel = classifyKimiSubagentLabel(rawTitle) ?? input.subagentTitle;
   if (!subagentLabel) {
     return event;
   }
@@ -736,10 +751,12 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
         if (ctx.promptsInFlight > 0) {
           return;
         }
-        ctx.passiveTurn = undefined;
         if (passive.timerHandle !== undefined) {
           clearTimeout(passive.timerHandle);
         }
+        // Keep ctx.passiveTurn listed while sealing: a burst arriving during
+        // the await attaches to this turn (its deltas land before the
+        // turn.completed below) instead of opening a new turn out of order.
         // Close the runtime's open assistant segment so the next burst
         // opens a fresh one instead of sharing the item across turns.
         yield* Effect.ignore(ctx.acp.sealPassiveBurst);
@@ -751,6 +768,15 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
           turnId: passive.turnId,
           payload: { state: "completed", stopReason: null },
         });
+        // The entry may have been re-armed during the seal; only clear it
+        // when it still belongs to this turn.
+        const current = ctx.passiveTurn;
+        if (current !== undefined && current.turnId === passive.turnId) {
+          if (current.timerHandle !== undefined) {
+            clearTimeout(current.timerHandle);
+          }
+          ctx.passiveTurn = undefined;
+        }
         ctx.activeTurnId = undefined;
         ctx.session = {
           ...ctx.session,
@@ -819,6 +845,125 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
           Effect.runFork(completePassiveTurn(ctx, { expectedTurnId: turnId }));
         }, passiveTurnIdleMs);
         ctx.passiveTurn = { turnId, timerHandle };
+      });
+
+    const KIMI_SUBAGENT_SUMMARY_MAX_CHARS = 200;
+
+    /**
+     * Surfaces Kimi's subagent dispatches on the shared task contract. The
+     * `Agent`/`AgentSwarm` tool calls are all the ACP server sends — no child
+     * identity, lineage, or inner-activity stream — so each dispatch becomes
+     * one task.started plus one terminal task.completed, linked to the
+     * transcript's collab tool-call row through toolUseId. No work is
+     * re-executed: the events only describe the dispatch's lifecycle.
+     */
+    const trackKimiSubagentTask = (
+      ctx: KimiSessionContext,
+      toolCall: AcpToolCallState,
+      rawPayload: unknown,
+    ) =>
+      Effect.gen(function* () {
+        const update = isRecord(rawPayload) ? rawPayload.update : undefined;
+        const rawTitle =
+          isRecord(update) && typeof update.title === "string" ? update.title : undefined;
+        const subagentLabel = classifyKimiSubagentLabel(rawTitle);
+        const toolCallId = toolCall.toolCallId;
+        const tracked = ctx.subagentTasks.get(toolCallId);
+        if (tracked?.finished === true) {
+          return;
+        }
+        if (subagentLabel === undefined && tracked === undefined) {
+          return;
+        }
+        const entry: {
+          readonly taskType: "subagent" | "subagent_batch";
+          readonly title: string;
+          finished: boolean;
+        } = tracked ?? {
+          taskType: subagentLabel === "Subagent" ? "subagent" : "subagent_batch",
+          title: subagentLabel ?? "Subagent",
+          finished: false,
+        };
+        const status = toolCall.status;
+        const isTerminal = status === "completed" || status === "failed";
+        if (tracked === undefined) {
+          ctx.subagentTasks.set(toolCallId, entry);
+          const rawInput = isRecord(update) ? update.rawInput : undefined;
+          const description =
+            isRecord(rawInput) &&
+            typeof rawInput.prompt === "string" &&
+            rawInput.prompt.trim().length > 0
+              ? rawInput.prompt.trim()
+              : undefined;
+          yield* offerRuntimeEvent({
+            type: "task.started",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId: ctx.activeTurnId,
+            payload: {
+              taskId: RuntimeTaskId.make(toolCallId),
+              toolUseId: toolCallId,
+              taskType: entry.taskType,
+              title: entry.title,
+              ...(description ? { description } : {}),
+            },
+          });
+        }
+        if (!isTerminal) {
+          return;
+        }
+        ctx.subagentTasks.set(toolCallId, { ...entry, finished: true });
+        const contentText = (
+          isRecord(update) && Array.isArray(update.content)
+            ? (update.content as ReadonlyArray<{ content?: { text?: string } }>)
+            : []
+        )
+          .map((block) => block.content?.text ?? "")
+          .join("")
+          .trim();
+        const summary = contentText.slice(0, KIMI_SUBAGENT_SUMMARY_MAX_CHARS);
+        yield* offerRuntimeEvent({
+          type: "task.completed",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId: ctx.activeTurnId,
+          payload: {
+            taskId: RuntimeTaskId.make(toolCallId),
+            toolUseId: toolCallId,
+            taskType: entry.taskType,
+            title: entry.title,
+            status: status === "completed" ? "completed" : "failed",
+            ...(summary ? { summary } : {}),
+          },
+        });
+      });
+
+    /** Settles every still-open subagent dispatch when the session or turn
+     * dies: subagents cannot outlive their kimi session. */
+    const finishKimiSubagentTasks = (ctx: KimiSessionContext) =>
+      Effect.gen(function* () {
+        for (const [toolCallId, task] of ctx.subagentTasks) {
+          if (task.finished) {
+            continue;
+          }
+          yield* offerRuntimeEvent({
+            type: "task.completed",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId: ctx.activeTurnId,
+            payload: {
+              taskId: RuntimeTaskId.make(toolCallId),
+              toolUseId: toolCallId,
+              taskType: task.taskType,
+              title: task.title,
+              status: "stopped",
+            },
+          });
+        }
+        ctx.subagentTasks.clear();
       });
 
     const getThreadSemaphore = (threadId: string) =>
@@ -912,6 +1057,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
         ctx.stopped = true;
         // A still-open passive turn must not outlive the session.
         yield* completePassiveTurn(ctx);
+        yield* finishKimiSubagentTasks(ctx);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
@@ -1209,6 +1355,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             promptsInFlight: 0,
             planRestoreModeId: undefined,
             passiveTurn: undefined,
+            subagentTasks: new Map(),
             stopped: false,
           };
 
@@ -1261,6 +1408,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                   case "ToolCallUpdated":
                     yield* ensurePassiveTurn(ctx);
                     yield* logNative(ctx.threadId, "session/update", event.rawPayload);
+                    yield* trackKimiSubagentTask(ctx, event.toolCall, event.rawPayload);
                     yield* offerRuntimeEvent(
                       makeKimiToolCallEvent({
                         stamp: yield* makeEventStamp(),
@@ -1268,6 +1416,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                         turnId: ctx.activeTurnId,
                         toolCall: event.toolCall,
                         rawPayload: event.rawPayload,
+                        subagentTitle: ctx.subagentTasks.get(event.toolCall.toolCallId)?.title,
                       }),
                     );
                     return;
@@ -1587,6 +1736,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
         yield* completePassiveTurn(ctx);
+        yield* finishKimiSubagentTasks(ctx);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         yield* Effect.ignore(
