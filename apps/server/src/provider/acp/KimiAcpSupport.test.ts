@@ -1,9 +1,15 @@
+// @effect-diagnostics globalDate:off
 import { describe, expect, it } from "@effect/vitest";
 import * as NodeOS from "node:os";
 
 import {
+  buildKimiGoalPrompt,
   classifyKimiSubagentLabel,
+  findKimiPlanMode,
   KIMI_DEFAULT_MODEL_SLUG,
+  KIMI_SYNTHETIC_COMMANDS,
+  isKimiAlreadyInPlanModeError,
+  matchKimiSyntheticPrompt,
   resolveKimiAcpBaseModelId,
   resolveKimiCredentialsPath,
   resolveRequestedKimiModeId,
@@ -160,5 +166,79 @@ describe("classifyKimiSubagentLabel", () => {
     expect(classifyKimiSubagentLabel(undefined)).toBeUndefined();
     expect(classifyKimiSubagentLabel("")).toBeUndefined();
     expect(classifyKimiSubagentLabel("Subagent")).toBeUndefined();
+  });
+});
+
+describe("matchKimiSyntheticPrompt", () => {
+  it("matches /plan and /goal with their arguments", () => {
+    expect(matchKimiSyntheticPrompt("/plan write the parser tests")).toEqual({
+      command: "plan",
+      args: "write the parser tests",
+    });
+    expect(matchKimiSyntheticPrompt("/goal ship 1.0 by friday")).toEqual({
+      command: "goal",
+      args: "ship 1.0 by friday",
+    });
+  });
+
+  it("matches a bare command with empty arguments", () => {
+    expect(matchKimiSyntheticPrompt("/plan")).toEqual({ command: "plan", args: "" });
+    expect(matchKimiSyntheticPrompt("  /goal  ")).toEqual({ command: "goal", args: "" });
+  });
+
+  it("keeps ordinary prompts and command mentions untouched", () => {
+    expect(matchKimiSyntheticPrompt("how does /goal work?")).toBeUndefined();
+    expect(matchKimiSyntheticPrompt("explain /plan mode")).toBeUndefined();
+    expect(matchKimiSyntheticPrompt("/compact")).toBeUndefined();
+    expect(matchKimiSyntheticPrompt("")).toBeUndefined();
+  });
+});
+
+describe("findKimiPlanMode", () => {
+  it("resolves the plan mode by alias", () => {
+    expect(findKimiPlanMode(modeState("default"))?.id).toBe("plan");
+  });
+
+  it("returns undefined when no plan mode is advertised", () => {
+    expect(
+      findKimiPlanMode({
+        currentModeId: "default",
+        availableModes: [
+          { id: "default", name: "Default" },
+          { id: "auto", name: "Auto" },
+        ],
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe("buildKimiGoalPrompt", () => {
+  it("maps the objective onto Kimi's native write-goal command", () => {
+    expect(buildKimiGoalPrompt("ship 1.0 by friday")).toBe("/write-goal ship 1.0 by friday");
+  });
+});
+
+describe("KIMI_SYNTHETIC_COMMANDS", () => {
+  it("covers exactly the TUI commands ACP cannot reach", () => {
+    expect(KIMI_SYNTHETIC_COMMANDS.map((definition) => definition.command)).toEqual([
+      "plan",
+      "goal",
+    ]);
+    for (const definition of KIMI_SYNTHETIC_COMMANDS) {
+      expect(definition.description.length).toBeGreaterThan(0);
+      expect(definition.inputHint.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("isKimiAlreadyInPlanModeError", () => {
+  it("matches Kimi's bogus already-in-plan-mode response", () => {
+    expect(isKimiAlreadyInPlanModeError("Internal error: Already in plan mode")).toBe(true);
+    expect(isKimiAlreadyInPlanModeError("Already in plan mode")).toBe(true);
+  });
+
+  it("leaves real failures alone", () => {
+    expect(isKimiAlreadyInPlanModeError("Internal error")).toBe(false);
+    expect(isKimiAlreadyInPlanModeError("")).toBe(false);
   });
 });

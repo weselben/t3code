@@ -5,12 +5,13 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
@@ -49,7 +50,11 @@ async function makeMockAgentWrapper(extraEnv?: Record<string, string>) {
   });
 }
 
-async function makeProbeWrapper(requestLogPath: string, argvLogPath: string) {
+async function makeProbeWrapper(
+  requestLogPath: string,
+  argvLogPath: string,
+  extraEnv?: Record<string, string>,
+) {
   const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kimi-acp-probe-"));
   return writeFakeCli({
     directory: dir,
@@ -57,6 +62,7 @@ async function makeProbeWrapper(requestLogPath: string, argvLogPath: string) {
     env: {
       T3_ACP_KIMI: "1",
       T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+      ...extraEnv,
     },
     source: execScriptSource({
       scriptPath: mockAgentPath,
@@ -198,15 +204,98 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
             : []
           : [],
       );
+      // The Agent call runs pending → in_progress → completed; pending and
+      // in-progress both display as "inProgress" in item rows. AgentSwarm
+      // arrives already completed.
       assert.deepStrictEqual(
-        subagentRows.map((payload) => [payload.title, payload.status]).toSorted(),
+        subagentRows.map((payload) => [payload.title, payload.status]),
         [
-          ["Agent swarm", "completed"],
+          ["Subagent", "inProgress"],
+          ["Subagent", "inProgress"],
           ["Subagent", "completed"],
+          ["Agent swarm", "completed"],
+        ],
+      );
+
+      const taskStarted = runtimeEvents.flatMap((event) =>
+        event.type === "task.started" ? [event.payload] : [],
+      );
+      assert.deepStrictEqual(
+        taskStarted.map((payload) => [
+          payload.taskId,
+          payload.taskType,
+          payload.toolUseId,
+          payload.description ?? null,
+        ]),
+        [
+          ["0:tool_agent_1", "subagent", "0:tool_agent_1", "review config tests"],
+          ["0:tool_swarm_1", "subagent_batch", "0:tool_swarm_1", null],
+        ],
+      );
+
+      const taskCompleted = runtimeEvents.flatMap((event) =>
+        event.type === "task.completed" ? [event.payload] : [],
+      );
+      assert.deepStrictEqual(
+        taskCompleted.map((payload) => [payload.taskId, payload.status, payload.summary ?? null]),
+        [
+          ["0:tool_agent_1", "completed", "agent_id: agent-123 finished review"],
+          [
+            "0:tool_swarm_1",
+            "completed",
+            '<agent_swarm_result><summary>2 agents</summary><subagent agent_id="agent-1" item="review" outcome="done">ok</subagent></agent_swarm_result>',
+          ],
         ],
       );
 
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("settles open subagent dispatches when the session stops", () =>
+    Effect.gen(function* () {
+      const adapter = yield* KimiAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("kimi-subagent-stop-thread");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_KIMI_EMIT_SUBAGENT_TOOL_CALLS: "1",
+          T3_ACP_KIMI_SUBAGENT_LEAVE_OPEN: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event: ProviderRuntimeEvent) => event.type === "session.exited",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      yield* adapter.sendTurn({ threadId, input: "dispatch agents", attachments: [] });
+      // The mock leaves the Agent dispatch in_progress forever; stopping the
+      // session must settle it as stopped.
+      yield* adapter.stopSession(threadId);
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+
+      const agentTask = runtimeEvents.flatMap((event) =>
+        event.type === "task.completed" && event.payload.taskId === "0:tool_agent_1"
+          ? [event.payload.status]
+          : [],
+      );
+      assert.deepStrictEqual(agentTask, ["stopped"]);
+      const swarmTask = runtimeEvents.flatMap((event) =>
+        event.type === "task.completed" && event.payload.taskId === "0:tool_swarm_1"
+          ? [event.payload.status]
+          : [],
+      );
+      assert.deepStrictEqual(swarmTask, ["completed"]);
     }),
   );
 
@@ -1069,6 +1158,129 @@ kimiAdapterTestLayer("KimiAdapterLive", (it) => {
       yield* adapter.stopSession(threadId);
     }),
   );
+
+  it.effect("runs synthetic /plan in kimi plan mode for one turn, then restores the mode", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kimi-plan-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kimi-acp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, NodePath.join(logDir, "argv.tsv")),
+      );
+
+      const rawAdapter = yield* makeKimiAdapter(decodeKimiSettings({ binaryPath: wrapperPath }));
+
+      yield* rawAdapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* rawAdapter.sendTurn({
+        threadId,
+        input: "/plan write the parser tests",
+        attachments: [],
+      });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const modeValues = requests
+        .filter(
+          (request) =>
+            request.method === "session/set_config_option" &&
+            (request.params as Record<string, unknown> | undefined)?.configId === "mode",
+        )
+        .map((request) => (request.params as Record<string, unknown>).value);
+      assert.deepStrictEqual(modeValues, ["yolo", "plan", "yolo"]);
+
+      const promptRequest = requests.find((request) => request.method === "session/prompt");
+      assert.ok(promptRequest, "expected a session/prompt request");
+      const promptBlocks = (promptRequest.params as Record<string, unknown>).prompt as Array<{
+        type: string;
+        text?: string;
+      }>;
+      assert.equal(promptBlocks[0]?.text, "write the parser tests");
+
+      yield* rawAdapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("maps a synthetic /goal prompt onto Kimi's native write-goal command", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kimi-goal-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kimi-acp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, NodePath.join(logDir, "argv.tsv")),
+      );
+
+      const rawAdapter = yield* makeKimiAdapter(decodeKimiSettings({ binaryPath: wrapperPath }));
+
+      yield* rawAdapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* rawAdapter.sendTurn({
+        threadId,
+        input: "/goal ship the release",
+        attachments: [],
+      });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const promptRequest = requests.find((request) => request.method === "session/prompt");
+      assert.ok(promptRequest, "expected a session/prompt request");
+      const promptBlocks = (promptRequest.params as Record<string, unknown>).prompt as Array<{
+        type: string;
+        text?: string;
+      }>;
+      assert.equal(promptBlocks[0]?.text, "/write-goal ship the release");
+
+      yield* rawAdapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects synthetic commands without their required arguments", () =>
+    Effect.gen(function* () {
+      const adapter = yield* KimiAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("kimi-synthetic-usage-thread");
+
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* settings.updateSettings({ providers: { kimi: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const planError = yield* adapter
+        .sendTurn({ threadId, input: "/plan", attachments: [] })
+        .pipe(Effect.flip);
+      assert.equal(planError._tag, "ProviderAdapterValidationError");
+      if (planError._tag !== "ProviderAdapterValidationError") return;
+      assert.equal(planError.operation, "sendTurn");
+      assert.ok(planError.issue.includes("Usage: /plan"), planError.issue);
+
+      const goalError = yield* adapter
+        .sendTurn({ threadId, input: "/goal", attachments: [] })
+        .pipe(Effect.flip);
+      assert.equal(goalError._tag, "ProviderAdapterValidationError");
+      if (goalError._tag !== "ProviderAdapterValidationError") return;
+      assert.equal(goalError.operation, "sendTurn");
+      assert.ok(goalError.issue.includes("Usage: /goal"), goalError.issue);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
 });
 
 function kimiPermissionRequest(
@@ -1147,4 +1359,78 @@ it("falls back to the hardcoded allow-always outcome for acceptAlways", () => {
   const request = kimiPermissionRequest([{ optionId: "not-today", kind: "reject_once" }]);
 
   assert.equal(selectDecisionPermissionOptionId(request, "acceptAlways"), "allow-always");
+});
+
+// Live clock only: passive updates arrive on the real event loop, and the
+// runtime's queue-pull pipeline does not advance while the test clock is
+// frozen.
+describe("KimiAdapterPassiveUpdates", () => {
+  it.live("surfaces passive kimi chunks as a provider-initiated turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kimi-passive-thread");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_KIMI_EMIT_PASSIVE_CHUNK: "1" }),
+      );
+
+      const rawAdapter = yield* makeKimiAdapter(decodeKimiSettings({ binaryPath: wrapperPath }), {
+        passiveTurnIdleMs: 300,
+      });
+
+      const events: ProviderRuntimeEvent[] = [];
+      const passiveTurnClosed = yield* Deferred.make<void>();
+      let completedCount = 0;
+      const drainFiber = yield* rawAdapter.streamEvents.pipe(
+        Stream.runForEach((event) => {
+          events.push(event);
+          if (event.type !== "turn.completed") {
+            return Effect.void;
+          }
+          completedCount += 1;
+          return completedCount === 2
+            ? Deferred.succeed(passiveTurnClosed, undefined).pipe(Effect.ignore)
+            : Effect.void;
+        }),
+        Effect.forkChild,
+      );
+
+      yield* rawAdapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kimi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* rawAdapter.sendTurn({ threadId, input: "hello", attachments: [] });
+
+      const closed = yield* Deferred.await(passiveTurnClosed).pipe(
+        Effect.timeoutOption("10 seconds"),
+      );
+      assert.ok(Option.isSome(closed), "expected the passive turn to close");
+
+      const turnStarts = events.filter((event) => event.type === "turn.started");
+      assert.equal(turnStarts.length, 2, "expected a real and a passive turn.started");
+      const passiveTurn = turnStarts[1];
+      assert.ok(passiveTurn, "expected the passive turn.started");
+
+      const passiveDelta = events.find(
+        (event) =>
+          event.type === "content.delta" &&
+          event.payload.delta.includes("background kimi-side update"),
+      );
+      assert.ok(passiveDelta, "expected the passive chunk as content.delta");
+      assert.deepEqual(passiveDelta.turnId, passiveTurn.turnId);
+
+      yield* Fiber.interrupt(drainFiber);
+      yield* rawAdapter.stopSession(threadId);
+
+      const turnCompletions = events.filter((event) => event.type === "turn.completed");
+      assert.equal(turnCompletions.length, 2, "expected the passive turn to close");
+      assert.deepEqual(turnCompletions[1]?.turnId, passiveTurn.turnId);
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3code-kimi-passive-test-",
+        }).pipe(Layer.provideMerge(NodeServices.layer)),
+      ),
+    ),
+  );
 });

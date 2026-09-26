@@ -19,6 +19,7 @@ import {
   checkKimiProviderStatus,
   makeKimiCommandCatalog,
 } from "./KimiProvider.ts";
+import { KIMI_SYNTHETIC_COMMANDS } from "../acp/KimiAcpSupport.ts";
 import { writeFakeCli } from "../../testUtils/fakeCli.ts";
 import type { ServerProviderShape } from "../Services/ServerProvider.ts";
 
@@ -228,6 +229,11 @@ it.layer(NodeServices.layer)("makeKimiCommandCatalog", (it) => {
 
         const workspace = yield* snapshotForCwd("/workspace-a");
         expect(workspace.slashCommands).toEqual([
+          ...KIMI_SYNTHETIC_COMMANDS.map((definition) => ({
+            name: definition.command,
+            description: definition.description,
+            input: { hint: definition.inputHint },
+          })),
           { name: "compact", description: "Compact the conversation" },
           { name: "status", description: "Show session status" },
           { name: "help", description: "Show help", input: { hint: "topic" } },
@@ -235,8 +241,63 @@ it.layer(NodeServices.layer)("makeKimiCommandCatalog", (it) => {
 
         const untouched = yield* snapshotForCwd("/workspace-b");
         expect(untouched.slashCommands).toEqual([
+          ...KIMI_SYNTHETIC_COMMANDS.map((definition) => ({
+            name: definition.command,
+            description: definition.description,
+            input: { hint: definition.inputHint },
+          })),
           { name: "compact", description: "Compact the conversation" },
         ]);
       }),
+  );
+
+  it.effect("lets a native command win over a synthetic one with the same name", () =>
+    Effect.gen(function* () {
+      const { onAvailableCommands, snapshotForCwd } = yield* makeKimiCommandCatalog(baseShape);
+
+      yield* onAvailableCommands(
+        [{ name: "plan", description: "Kimi's own plan command" }],
+        "/workspace-native",
+      );
+
+      const workspace = yield* snapshotForCwd("/workspace-native");
+      expect(workspace.slashCommands).toEqual([
+        {
+          name: "goal",
+          description: "Create a goal Kimi keeps working toward across turns.",
+          input: { hint: "objective, optionally with a completion criterion" },
+        },
+        { name: "plan", description: "Kimi's own plan command" },
+      ]);
+    }),
+  );
+
+  it.effect("keeps synthetic commands in the stored workspace list without duplicating them", () =>
+    Effect.gen(function* () {
+      const { onAvailableCommands, snapshotForCwd } = yield* makeKimiCommandCatalog(baseShape);
+
+      yield* onAvailableCommands(
+        [{ name: "compact", description: "Compact the conversation" }],
+        "/workspace-synthetic",
+      );
+
+      const first = yield* snapshotForCwd("/workspace-synthetic");
+      const syntheticNames = KIMI_SYNTHETIC_COMMANDS.map((definition) => definition.command);
+      expect(first.slashCommands.map((command) => command.name)).toEqual([
+        ...syntheticNames,
+        "compact",
+      ]);
+      expect(
+        first.workspaceSnapshots
+          ?.find((entry) => entry.cwd === "/workspace-synthetic")
+          ?.slashCommands.map((command) => command.name),
+      ).toEqual([...syntheticNames, "compact"]);
+
+      const second = yield* snapshotForCwd("/workspace-synthetic");
+      expect(second.slashCommands.map((command) => command.name)).toEqual([
+        ...syntheticNames,
+        "compact",
+      ]);
+    }),
   );
 });

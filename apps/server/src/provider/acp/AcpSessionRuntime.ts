@@ -88,6 +88,13 @@ export interface AcpSessionRuntimeOptions {
   /** Native cancellation waits for the prompt response and the getEvents consumer to drain. */
   readonly cancelBehavior?: "interrupt" | "wait-for-prompt";
   readonly cancelTimeout?: Duration.Input;
+  /**
+   * Let assistant chunks through while no client prompt is active. For
+   * harnesses that act on their own (cron fires, background agents) — the
+   * adapter turns the burst into a provider-initiated turn. Defaults to off,
+   * which drops stray chunks between prompts.
+   */
+  readonly passiveAssistantUpdates?: boolean;
   readonly clientCapabilities?: EffectAcpSchema.InitializeRequest["clientCapabilities"];
   readonly clientInfo: {
     readonly name: string;
@@ -228,6 +235,8 @@ export class AcpSessionRuntime extends Context.Service<
     readonly getEvents: () => Stream.Stream<AcpSessionRuntimeEvent, never>;
     /** Waits for queued events to be processed, or for the runtime scope to close. */
     readonly drainEvents: Effect.Effect<void>;
+    /** Closes the open assistant segment and resets the passive-update gate; used by adapters after a provider-initiated burst completes. */
+    readonly sealPassiveBurst: Effect.Effect<void>;
     /** Latest mode state observed from session setup and `session/update` notifications. */
     readonly getModeState: Effect.Effect<AcpSessionModeState | undefined>;
     /** Latest configuration options observed from session setup and configuration writes. */
@@ -583,7 +592,16 @@ export const make = (
             (notification.update.sessionUpdate === "agent_message_chunk" ||
               notification.update.sessionUpdate === "agent_thought_chunk")
           ) {
-            return;
+            // Harnesses that act on their own (cron fires, background agents)
+            // stream assistant chunks while no client prompt is active. The
+            // drop above shields providers that never do this; opt-in runtimes
+            // let the chunks through so the adapter can surface them as a
+            // provider-initiated turn.
+            if (options.passiveAssistantUpdates !== true) {
+              return;
+            }
+            yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
+            yield* Ref.set(assistantUpdatesOpenRef, true);
           }
           yield* processSessionUpdate(notification);
         }),
@@ -956,6 +974,15 @@ export const make = (
       yield* Effect.raceFirst(Deferred.await(acknowledge), Deferred.await(runtimeClosed));
     });
 
+    // Serialize with incoming notifications so a chunk cannot re-open the
+    // assistant segment between the close and the flag flip.
+    const sealPassiveBurst = notificationSemaphore.withPermit(
+      Effect.gen(function* () {
+        yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
+        yield* Ref.set(assistantUpdatesOpenRef, false);
+      }),
+    );
+
     const retireRuntime = Effect.fn("AcpSessionRuntime.retireRuntime")(function* (
       error: EffectAcpErrors.AcpError,
     ) {
@@ -1022,6 +1049,7 @@ export const make = (
       start: () => start,
       getEvents: () => Stream.fromQueue(eventQueue),
       drainEvents,
+      sealPassiveBurst: sealPassiveBurst,
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
       prompt: (payload, promptOptions?) =>

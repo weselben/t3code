@@ -12,16 +12,17 @@ import {
   type ProviderInteractionMode,
   type ProviderRuntimeEvent,
   type ProviderSession,
-  type ProviderUserInputAnswers,
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
+  RuntimeTaskId,
   type RuntimeMode,
   type ThreadId,
   TurnId,
   UserInputQuestion,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -49,6 +50,7 @@ import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
+  type ProviderAdapterError,
 } from "../Errors.ts";
 import { acpPermissionOutcome, mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
@@ -64,17 +66,25 @@ import { type AcpToolCallState, parsePermissionRequest } from "../acp/AcpRuntime
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
 import {
   applyKimiAcpModelSelection,
+  buildKimiGoalPrompt,
   classifyKimiSubagentLabel,
   currentKimiModelIdFromSessionSetup,
+  findKimiPlanMode,
+  isKimiAlreadyInPlanModeError,
   makeKimiAcpRuntime,
+  matchKimiSyntheticPrompt,
   resolveKimiAcpBaseModelId,
   resolveRequestedKimiModeId,
+  type KimiSyntheticPrompt,
 } from "../acp/KimiAcpSupport.ts";
 import { type KimiAdapterShape } from "../Services/KimiAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("kimi");
+
+/** How long a provider-initiated turn stays open after its last passive event. */
+const KIMI_PASSIVE_TURN_IDLE_MS_DEFAULT = 10_000;
 const KIMI_RESUME_VERSION = 1 as const;
 
 /** Serializes diagnostic payloads when they are representable as JSON. */
@@ -96,6 +106,11 @@ export interface KimiAdapterLiveOptions {
    * Defaults to the legacy built-in instance id (`kimi`).
    */
   readonly instanceId?: ProviderInstanceId;
+  /**
+   * How long a provider-initiated (synthetic) turn stays open after its last
+   * passive event. Tests shrink this; production keeps the default.
+   */
+  readonly passiveTurnIdleMs?: number;
   /**
    * Optional per-session settings resolver. When provided the adapter yields
    * this effect at the start of every session and uses the result instead of
@@ -154,8 +169,127 @@ interface KimiSessionContext {
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
   promptsInFlight: number;
+  /** Mode id to restore when the current turn settles. Set by a synthetic
+   * `/plan` command so the read-only planning request does not outlive its
+   * turn, mirroring Kimi's message-scoped plan behavior. */
+  planRestoreModeId: string | undefined;
+  /** Provider-initiated turn (cron fire, background-agent report): open while
+   * passive events stream, closed after an idle gap or by the next sendTurn. */
+  passiveTurn:
+    | {
+        readonly turnId: TurnId;
+        timerHandle: NodeJS.Timeout | undefined;
+      }
+    | undefined;
+  /** Open subagent dispatches (`Agent`/`AgentSwarm` tool calls) keyed by ACP
+   * tool-call id. Tracking keys on the id because Kimi drifts or drops tool
+   * titles across the lifecycle; the entry keeps the linkage emitted on
+   * task.completed and the display title for late, title-less item rows.
+   * `finished` marks ids whose terminal event already went out, so repeated
+   * completed updates cannot re-open or duplicate a task. */
+  readonly subagentTasks: Map<
+    string,
+    { readonly taskType: "subagent" | "subagent_batch"; readonly title: string; finished: boolean }
+  >;
   stopped: boolean;
 }
+
+/**
+ * Switches the Kimi session mode, tolerating the Kimi 2.0.x defect where a
+ * switch to plan mode applies but the request still fails with
+ * "Internal error: Already in plan mode". Every other failure propagates.
+ */
+const setKimiSessionModeTolerant = <E, E2>(
+  setMode: (modeId: string) => Effect.Effect<unknown, E>,
+  modeId: string,
+  mapError: (cause: E) => E2,
+): Effect.Effect<void, E2> =>
+  Effect.gen(function* () {
+    const outcome = yield* Effect.exit(setMode(modeId));
+    if (Exit.isSuccess(outcome)) {
+      return;
+    }
+    const error = Cause.findErrorOption(outcome.cause);
+    if (Option.isNone(error)) {
+      return yield* Effect.die(Cause.squash(outcome.cause));
+    }
+    const cause = (error.value as { readonly cause?: unknown }).cause;
+    const causeMessage = cause instanceof Error ? cause.message : String(cause ?? "");
+    if (isKimiAlreadyInPlanModeError(causeMessage)) {
+      return;
+    }
+    return yield* Effect.fail(mapError(error.value));
+  });
+
+/**
+ * Applies a synthetic `/plan` or `/goal` prompt before it reaches the ACP
+ * session. Kimi's TUI arms these as message commands, but its ACP server
+ * advertises neither and rejects them as unknown.
+ *
+ * `/plan` switches the session to Kimi's native plan mode for the current
+ * turn and forwards the arguments verbatim; the previous mode is restored
+ * once the turn settles (see the sendTurn `ensuring` block). `/goal` is
+ * rewritten into an instruction because ACP exposes no goal surface. Kimi's
+ * `/swarm` has no ACP surface either, so it stays unsupported instead of
+ * being approximated with prompt text.
+ */
+const applyKimiSyntheticCommand = (
+  ctx: KimiSessionContext,
+  synthetic: KimiSyntheticPrompt,
+  threadId: ThreadId,
+): Effect.Effect<string, ProviderAdapterError | ProviderAdapterValidationError> =>
+  Effect.gen(function* () {
+    switch (synthetic.command) {
+      case "plan": {
+        if (!synthetic.args) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue:
+              "Usage: /plan <what to plan> — the request runs in Kimi's plan mode for this turn only.",
+          });
+        }
+        const modeState = yield* ctx.acp.getModeState;
+        const planMode = modeState === undefined ? undefined : findKimiPlanMode(modeState);
+        if (planMode === undefined || modeState === undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "This Kimi session does not expose a plan mode.",
+          });
+        }
+        if (planMode.id !== modeState.currentModeId) {
+          ctx.planRestoreModeId = modeState.currentModeId;
+          // Residual race: a steer landing between this setMode and the
+          // prompt dispatch below can re-apply its own mode, and Kimi's ACP
+          // offers no atomic set-mode-and-prompt. The post-turn restore in
+          // sendTurn's `ensuring` bounds the leak to this turn.
+          yield* setKimiSessionModeTolerant(
+            (modeId) => ctx.acp.setMode(modeId),
+            planMode.id,
+            (cause) => mapAcpToAdapterError(PROVIDER, threadId, "session/set_mode", cause),
+          ).pipe(
+            Effect.tapError(() =>
+              Effect.sync(() => {
+                ctx.planRestoreModeId = undefined;
+              }),
+            ),
+          );
+        }
+        return synthetic.args;
+      }
+      case "goal": {
+        if (!synthetic.args) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "Usage: /goal <objective> — optionally include a completion criterion.",
+          });
+        }
+        return buildKimiGoalPrompt(synthetic.args);
+      }
+    }
+  });
 
 /** Cancels and consumes every outstanding permission request for a session. */
 function settlePendingApprovalsAsCancelled(
@@ -239,13 +373,10 @@ function applyRequestedSessionConfiguration<E>(input: {
       return;
     }
 
-    yield* input.runtime.setMode(requestedModeId).pipe(
-      Effect.mapError((cause) =>
-        input.mapError({
-          cause,
-          method: "session/set_mode",
-        }),
-      ),
+    yield* setKimiSessionModeTolerant(
+      (modeId) => input.runtime.setMode(modeId),
+      requestedModeId,
+      (cause) => input.mapError({ cause, method: "session/set_mode" }),
     );
   });
 }
@@ -514,6 +645,10 @@ function makeKimiToolCallEvent(input: {
   readonly turnId: TurnId | undefined;
   readonly toolCall: AcpToolCallState;
   readonly rawPayload: unknown;
+  /** Display label already tracked for this tool-call id, used when the
+   * raw notification dropped the title (Kimi drifts titles across the
+   * lifecycle and emits generic "Tool" states for late updates). */
+  readonly subagentTitle?: string | undefined;
 }): ProviderRuntimeEvent {
   const event = makeAcpToolCallEvent({
     stamp: input.stamp,
@@ -528,10 +663,10 @@ function makeKimiToolCallEvent(input: {
   }
   // The parsed state carries a presentation summary (e.g. Kimi's `Agent`
   // dispatch with kind `read` becomes "Read file"), so the dispatch name is
-  // read back from the raw notification.
+  // read back from the raw notification; the tracked entry is the fallback.
   const update = isRecord(input.rawPayload) ? input.rawPayload.update : undefined;
   const rawTitle = isRecord(update) && typeof update.title === "string" ? update.title : undefined;
-  const subagentLabel = classifyKimiSubagentLabel(rawTitle);
+  const subagentLabel = classifyKimiSubagentLabel(rawTitle) ?? input.subagentTitle;
   if (!subagentLabel) {
     return event;
   }
@@ -552,6 +687,7 @@ function makeKimiToolCallEvent(input: {
 export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapterLiveOptions) {
   return Effect.gen(function* () {
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("kimi");
+    const passiveTurnIdleMs = options?.passiveTurnIdleMs ?? KIMI_PASSIVE_TURN_IDLE_MS_DEFAULT;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -599,6 +735,236 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
 
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
+
+    const completePassiveTurn = (
+      ctx: KimiSessionContext,
+      options?: { readonly expectedTurnId?: TurnId },
+    ) =>
+      Effect.gen(function* () {
+        const passive = ctx.passiveTurn;
+        if (!passive) {
+          return;
+        }
+        if (options?.expectedTurnId !== undefined && options.expectedTurnId !== passive.turnId) {
+          return;
+        }
+        if (ctx.promptsInFlight > 0) {
+          return;
+        }
+        if (passive.timerHandle !== undefined) {
+          clearTimeout(passive.timerHandle);
+        }
+        // Keep ctx.passiveTurn listed while sealing: a burst arriving during
+        // the await attaches to this turn (its deltas land before the
+        // turn.completed below) instead of opening a new turn out of order.
+        // Close the runtime's open assistant segment so the next burst
+        // opens a fresh one instead of sharing the item across turns.
+        yield* Effect.ignore(ctx.acp.sealPassiveBurst);
+        yield* offerRuntimeEvent({
+          type: "turn.completed",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId: passive.turnId,
+          payload: { state: "completed", stopReason: null },
+        });
+        // The entry may have been re-armed during the seal; only clear it
+        // when it still belongs to this turn.
+        const current = ctx.passiveTurn;
+        if (current !== undefined && current.turnId === passive.turnId) {
+          if (current.timerHandle !== undefined) {
+            clearTimeout(current.timerHandle);
+          }
+          ctx.passiveTurn = undefined;
+        }
+        ctx.activeTurnId = undefined;
+        ctx.session = {
+          ...ctx.session,
+          status: "ready",
+          activeTurnId: undefined,
+          updatedAt: yield* nowIso,
+        };
+      });
+
+    // Passive bursts (cron fires, background-agent reports) arrive without a
+    // client prompt. Auto-start a synthetic turn for them — the same approach
+    // the Claude adapter takes — and close it after an idle gap so the
+    // session does not stay "running" forever. A real sendTurn closes the
+    // stale synthetic turn first, so it never blocks the user's next prompt.
+    const ensurePassiveTurn = (ctx: KimiSessionContext) =>
+      Effect.gen(function* () {
+        if (ctx.promptsInFlight > 0) {
+          return;
+        }
+        if (ctx.passiveTurn !== undefined) {
+          // Re-arm the idle timer so a burst longer than the idle gap
+          // still lands in a single turn.
+          const passive = ctx.passiveTurn;
+          if (passive.timerHandle !== undefined) {
+            clearTimeout(passive.timerHandle);
+          }
+          // @effect-diagnostics-next-line globalTimersInEffect:off
+          const timerHandle = setTimeout(() => {
+            if (
+              ctx.passiveTurn?.turnId !== passive.turnId ||
+              ctx.promptsInFlight > 0 ||
+              ctx.stopped
+            ) {
+              return;
+            }
+            Effect.runFork(completePassiveTurn(ctx, { expectedTurnId: passive.turnId }));
+          }, passiveTurnIdleMs);
+          ctx.passiveTurn = { turnId: passive.turnId, timerHandle };
+          return;
+        }
+        const turnId = TurnId.make(yield* randomUUIDv4);
+        const stamp = yield* makeEventStamp();
+        ctx.passiveTurn = { turnId, timerHandle: undefined };
+        ctx.activeTurnId = turnId;
+        ctx.session = {
+          ...ctx.session,
+          status: "running",
+          activeTurnId: turnId,
+          updatedAt: yield* nowIso,
+        };
+        yield* offerRuntimeEvent({
+          type: "turn.started",
+          ...stamp,
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId,
+          payload: {},
+        });
+        // The idle close runs on the default Effect runtime from a raw
+        // timer, so no external fiber or runtime capture is involved.
+        // @effect-diagnostics-next-line globalTimersInEffect:off
+        const timerHandle = setTimeout(() => {
+          if (ctx.passiveTurn?.turnId !== turnId || ctx.promptsInFlight > 0 || ctx.stopped) {
+            return;
+          }
+          Effect.runFork(completePassiveTurn(ctx, { expectedTurnId: turnId }));
+        }, passiveTurnIdleMs);
+        ctx.passiveTurn = { turnId, timerHandle };
+      });
+
+    const KIMI_SUBAGENT_SUMMARY_MAX_CHARS = 200;
+
+    /**
+     * Surfaces Kimi's subagent dispatches on the shared task contract. The
+     * `Agent`/`AgentSwarm` tool calls are all the ACP server sends — no child
+     * identity, lineage, or inner-activity stream — so each dispatch becomes
+     * one task.started plus one terminal task.completed, linked to the
+     * transcript's collab tool-call row through toolUseId. No work is
+     * re-executed: the events only describe the dispatch's lifecycle.
+     */
+    const trackKimiSubagentTask = (
+      ctx: KimiSessionContext,
+      toolCall: AcpToolCallState,
+      rawPayload: unknown,
+    ) =>
+      Effect.gen(function* () {
+        const update = isRecord(rawPayload) ? rawPayload.update : undefined;
+        const rawTitle =
+          isRecord(update) && typeof update.title === "string" ? update.title : undefined;
+        const subagentLabel = classifyKimiSubagentLabel(rawTitle);
+        const toolCallId = toolCall.toolCallId;
+        const tracked = ctx.subagentTasks.get(toolCallId);
+        if (tracked?.finished === true) {
+          return;
+        }
+        if (subagentLabel === undefined && tracked === undefined) {
+          return;
+        }
+        const entry: {
+          readonly taskType: "subagent" | "subagent_batch";
+          readonly title: string;
+          finished: boolean;
+        } = tracked ?? {
+          taskType: subagentLabel === "Subagent" ? "subagent" : "subagent_batch",
+          title: subagentLabel ?? "Subagent",
+          finished: false,
+        };
+        const status = toolCall.status;
+        const isTerminal = status === "completed" || status === "failed";
+        if (tracked === undefined) {
+          ctx.subagentTasks.set(toolCallId, entry);
+          const rawInput = isRecord(update) ? update.rawInput : undefined;
+          const description =
+            isRecord(rawInput) &&
+            typeof rawInput.prompt === "string" &&
+            rawInput.prompt.trim().length > 0
+              ? rawInput.prompt.trim()
+              : undefined;
+          yield* offerRuntimeEvent({
+            type: "task.started",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId: ctx.activeTurnId,
+            payload: {
+              taskId: RuntimeTaskId.make(toolCallId),
+              toolUseId: toolCallId,
+              taskType: entry.taskType,
+              title: entry.title,
+              ...(description ? { description } : {}),
+            },
+          });
+        }
+        if (!isTerminal) {
+          return;
+        }
+        ctx.subagentTasks.set(toolCallId, { ...entry, finished: true });
+        const contentText = (
+          isRecord(update) && Array.isArray(update.content)
+            ? (update.content as ReadonlyArray<{ content?: { text?: string } }>)
+            : []
+        )
+          .map((block) => block.content?.text ?? "")
+          .join("")
+          .trim();
+        const summary = contentText.slice(0, KIMI_SUBAGENT_SUMMARY_MAX_CHARS);
+        yield* offerRuntimeEvent({
+          type: "task.completed",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId: ctx.activeTurnId,
+          payload: {
+            taskId: RuntimeTaskId.make(toolCallId),
+            toolUseId: toolCallId,
+            taskType: entry.taskType,
+            title: entry.title,
+            status: status === "completed" ? "completed" : "failed",
+            ...(summary ? { summary } : {}),
+          },
+        });
+      });
+
+    /** Settles every still-open subagent dispatch when the session or turn
+     * dies: subagents cannot outlive their kimi session. */
+    const finishKimiSubagentTasks = (ctx: KimiSessionContext) =>
+      Effect.gen(function* () {
+        for (const [toolCallId, task] of ctx.subagentTasks) {
+          if (task.finished) {
+            continue;
+          }
+          yield* offerRuntimeEvent({
+            type: "task.completed",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId: ctx.activeTurnId,
+            payload: {
+              taskId: RuntimeTaskId.make(toolCallId),
+              toolUseId: toolCallId,
+              taskType: task.taskType,
+              title: task.title,
+              status: "stopped",
+            },
+          });
+        }
+        ctx.subagentTasks.clear();
+      });
 
     const getThreadSemaphore = (threadId: string) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
@@ -689,6 +1055,9 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        // A still-open passive turn must not outlive the session.
+        yield* completePassiveTurn(ctx);
+        yield* finishKimiSubagentTasks(ctx);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
@@ -984,6 +1353,9 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             activeTurnId: undefined,
             currentModelId,
             promptsInFlight: 0,
+            planRestoreModeId: undefined,
+            passiveTurn: undefined,
+            subagentTasks: new Map(),
             stopped: false,
           };
 
@@ -1004,6 +1376,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     );
                     return;
                   case "AssistantItemStarted":
+                    yield* ensurePassiveTurn(ctx);
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
                         stamp: yield* makeEventStamp(),
@@ -1016,6 +1389,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     );
                     return;
                   case "AssistantItemCompleted":
+                    yield* ensurePassiveTurn(ctx);
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
                         stamp: yield* makeEventStamp(),
@@ -1032,7 +1406,9 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     yield* emitPlanUpdate(ctx, event.payload, event.rawPayload);
                     return;
                   case "ToolCallUpdated":
+                    yield* ensurePassiveTurn(ctx);
                     yield* logNative(ctx.threadId, "session/update", event.rawPayload);
+                    yield* trackKimiSubagentTask(ctx, event.toolCall, event.rawPayload);
                     yield* offerRuntimeEvent(
                       makeKimiToolCallEvent({
                         stamp: yield* makeEventStamp(),
@@ -1040,10 +1416,12 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                         turnId: ctx.activeTurnId,
                         toolCall: event.toolCall,
                         rawPayload: event.rawPayload,
+                        subagentTitle: ctx.subagentTasks.get(event.toolCall.toolCallId)?.title,
                       }),
                     );
                     return;
                   case "ThoughtDelta":
+                    yield* ensurePassiveTurn(ctx);
                     yield* logNative(ctx.threadId, "session/update", event.rawPayload);
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
@@ -1058,6 +1436,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     );
                     return;
                   case "ContentDelta":
+                    yield* ensurePassiveTurn(ctx);
                     yield* logNative(ctx.threadId, "session/update", event.rawPayload);
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
@@ -1120,6 +1499,23 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
     const sendTurn: KimiAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+        // Reject argumentless synthetic commands before any turn setup so a
+        // usage error never emits turn.started or touches the session mode.
+        const earlySynthetic = matchKimiSyntheticPrompt(input.input?.trim() ?? "");
+        if (earlySynthetic !== undefined && !earlySynthetic.args) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue:
+              earlySynthetic.command === "plan"
+                ? "Usage: /plan <what to plan> — the request runs in Kimi's plan mode for this turn only."
+                : "Usage: /goal <objective> — optionally include a completion criterion.",
+          });
+        }
+        // A passive burst still open (cron fire, background-agent report)
+        // ends here: the user's prompt starts a real turn that must not be
+        // merged into provider-initiated work.
+        yield* completePassiveTurn(ctx);
         // Admission runs synchronously before any async setup so a concurrent
         // sendTurn observes this turn through `activeTurnId`, not just the
         // pre-claim `promptsInFlight` count. Without claiming the active turn
@@ -1157,13 +1553,11 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             modeState: yield* ctx.acp.getModeState,
           });
           if (requestedModeId) {
-            yield* ctx.acp
-              .setMode(requestedModeId)
-              .pipe(
-                Effect.mapError((cause) =>
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_mode", cause),
-                ),
-              );
+            yield* setKimiSessionModeTolerant(
+              (modeId) => ctx.acp.setMode(modeId),
+              requestedModeId,
+              (cause) => mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_mode", cause),
+            );
           }
 
           ctx.session = {
@@ -1185,8 +1579,18 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
 
           const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
           const rawPrompt = input.input?.trim() ?? "";
-          if (rawPrompt) {
-            promptParts.push({ type: "text", text: rawPrompt });
+          // Synthetic /plan, /goal, and /swarm: Kimi's ACP server rejects the
+          // TUI's message commands as unknown, so matching prompts are
+          // rewritten before they reach the session. /plan additionally
+          // switches the session to its plan mode for this turn and restores
+          // the previous mode once the turn settles.
+          const synthetic = matchKimiSyntheticPrompt(rawPrompt);
+          const effectivePrompt =
+            synthetic === undefined
+              ? rawPrompt
+              : yield* applyKimiSyntheticCommand(ctx, synthetic, input.threadId);
+          if (effectivePrompt) {
+            promptParts.push({ type: "text", text: effectivePrompt });
           }
           if (input.attachments && input.attachments.length > 0) {
             for (const attachment of input.attachments) {
@@ -1237,7 +1641,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
           // command into an ordinary model prompt or change its arguments.
           const result = yield* ctx.acp
             .prompt({
-              prompt: /^\/[^\s/]+(?:\s|$)/.test(rawPrompt)
+              prompt: /^\/[^\s/]+(?:\s|$)/.test(effectivePrompt)
                 ? promptParts
                 : [
                     ...promptParts,
@@ -1295,8 +1699,34 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
           };
         }).pipe(
           Effect.ensuring(
-            Effect.sync(() => {
+            Effect.gen(function* () {
               ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+              if (ctx.promptsInFlight > 0) {
+                return;
+              }
+              // A synthetic /plan restores the session's previous mode once
+              // the last prompt of the turn settles, including cancelled or
+              // failed prompts. A failed restore keeps planRestoreModeId so
+              // the next settle retries instead of leaking plan mode; the
+              // turn result must not be masked by the best-effort reset.
+              if (ctx.planRestoreModeId !== undefined) {
+                const restoreModeId = ctx.planRestoreModeId;
+                const restored = yield* Effect.exit(
+                  ctx.acp
+                    .setMode(restoreModeId)
+                    .pipe(
+                      Effect.mapError((error) =>
+                        mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_mode", error),
+                      ),
+                    ),
+                );
+                if (Exit.isSuccess(restored)) {
+                  ctx.planRestoreModeId = undefined;
+                  yield* Effect.ignore(ctx.acp.drainEvents);
+                } else {
+                  yield* Effect.logError("Kimi /plan mode restore failed; will retry next turn.");
+                }
+              }
             }),
           ),
         );
@@ -1305,6 +1735,8 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
     const interruptTurn: KimiAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        yield* completePassiveTurn(ctx);
+        yield* finishKimiSubagentTasks(ctx);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         yield* Effect.ignore(

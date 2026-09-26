@@ -5,6 +5,7 @@ import {
   type ServerProvider,
   type ServerProviderAuth,
   type ServerProviderModel,
+  type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import type * as EffectAcpSchema from "effect-acp/schema";
 import { causeErrorTag } from "@t3tools/shared/observability";
@@ -35,7 +36,7 @@ import {
   enrichProviderSnapshotWithVersionAdvisory,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
-import { resolveKimiCredentialsPath } from "../acp/KimiAcpSupport.ts";
+import { KIMI_SYNTHETIC_COMMANDS, resolveKimiCredentialsPath } from "../acp/KimiAcpSupport.ts";
 import type { ServerProviderShape } from "../Services/ServerProvider.ts";
 
 const KIMI_PRESENTATION = {
@@ -316,6 +317,27 @@ export const enrichKimiSnapshot = (input: {
  * snapshot can surface it; until a session has run the snapshot falls back
  * to the built-in compact command.
  */
+/**
+ * Synthetic `/plan` and `/goal` fill the gaps in Kimi's advertised command
+ * list: the TUI arms them as message commands, while the ACP server rejects
+ * them as unknown. Native commands win on a name clash.
+ */
+const mergeKimiSyntheticCommands = (
+  native: ReadonlyArray<ServerProviderSlashCommand>,
+): Array<ServerProviderSlashCommand> => {
+  const names = new Set(native.map((command) => command.name));
+  return [
+    ...KIMI_SYNTHETIC_COMMANDS.filter((definition) => !names.has(definition.command)).map(
+      (definition) => ({
+        name: definition.command,
+        description: definition.description,
+        input: { hint: definition.inputHint },
+      }),
+    ),
+    ...native,
+  ];
+};
+
 export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(function* (
   provider: ServerProviderShape,
 ) {
@@ -323,9 +345,14 @@ export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(functi
     [],
   );
   const getSnapshot = Effect.all([provider.getSnapshot, SubscriptionRef.get(workspaces)]).pipe(
-    Effect.map(([snapshot, workspaceSnapshots]) =>
-      workspaceSnapshots.length > 0 ? { ...snapshot, workspaceSnapshots } : snapshot,
-    ),
+    Effect.map(([snapshot, workspaceSnapshots]) => ({
+      ...snapshot,
+      workspaceSnapshots: workspaceSnapshots.map((entry) => ({
+        ...entry,
+        slashCommands: mergeKimiSyntheticCommands(entry.slashCommands ?? []),
+      })),
+      slashCommands: mergeKimiSyntheticCommands(snapshot.slashCommands ?? []),
+    })),
   );
   const snapshotForCwd = Effect.fn("KimiCommandCatalog.snapshotForCwd")(function* (cwd: string) {
     const machineSnapshot = yield* provider.getSnapshot;
@@ -336,9 +363,11 @@ export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(functi
         {
           cwd,
           checkedAt,
-          slashCommands:
+          slashCommands: mergeKimiSyntheticCommands(
             entries.find((entry) => entry.cwd === cwd)?.slashCommands ??
-            machineSnapshot.slashCommands,
+              machineSnapshot.slashCommands ??
+              [],
+          ),
           skills: entries.find((entry) => entry.cwd === cwd)?.skills ?? machineSnapshot.skills,
         },
       ].slice(-16),
@@ -347,9 +376,11 @@ export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(functi
     return {
       ...snapshot,
       checkedAt,
-      slashCommands:
+      slashCommands: mergeKimiSyntheticCommands(
         snapshot.workspaceSnapshots?.find((entry) => entry.cwd === cwd)?.slashCommands ??
-        snapshot.slashCommands,
+          snapshot.slashCommands ??
+          [],
+      ),
     };
   });
   // Kimi's advertised list is passed through verbatim, minus malformed rows.
@@ -359,7 +390,7 @@ export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(functi
     cwd: string,
   ) {
     const seen = new Set<string>();
-    const slashCommands = commands.flatMap((command) => {
+    const nativeSlashCommands = commands.flatMap((command) => {
       const name = command.name.trim();
       if (!name || seen.has(name)) return [];
       seen.add(name);
@@ -373,6 +404,7 @@ export const makeKimiCommandCatalog = Effect.fn("makeKimiCommandCatalog")(functi
         },
       ];
     });
+    const slashCommands = mergeKimiSyntheticCommands(nativeSlashCommands);
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
     yield* SubscriptionRef.update(workspaces, (entries) =>
       [

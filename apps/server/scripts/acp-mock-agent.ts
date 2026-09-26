@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics globalDateInEffect:off
 import * as NodeFS from "node:fs";
 
 import * as Effect from "effect/Effect";
@@ -17,6 +18,8 @@ const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const kimiProfile = process.env.T3_ACP_KIMI === "1";
 const emitKimiSubagentToolCalls = process.env.T3_ACP_KIMI_EMIT_SUBAGENT_TOOL_CALLS === "1";
+const leaveKimiSubagentOpen = process.env.T3_ACP_KIMI_SUBAGENT_LEAVE_OPEN === "1";
+const emitKimiPassiveChunk = process.env.T3_ACP_KIMI_EMIT_PASSIVE_CHUNK === "1";
 const emitKimiElicitationMode = process.env.T3_ACP_KIMI_EMIT_ELICIT;
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitInterleavedAssistantToolCalls =
@@ -740,6 +743,21 @@ const program = Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
 
+      if (emitKimiPassiveChunk) {
+        // Harness-initiated output: fires long after the prompt response has
+        // been written, so only a runtime passing passive updates through
+        // will surface it.
+        setTimeout(() => {
+          writeJsonRpcNotification("session/update", {
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "background kimi-side update landed" },
+            },
+          });
+        }, 1500);
+      }
+
       if (completeFirstPromptOnCancel && promptCount === 1) {
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,
@@ -781,9 +799,10 @@ const program = Effect.gen(function* () {
       }
 
       if (kimiProfile && emitKimiSubagentToolCalls) {
-        // Mirrors the real Kimi ACP: sub-agent dispatch surfaces as a single
+        // Mirrors the real Kimi ACP: sub-agent dispatch surfaces as a
         // tool_call classified by title, with no _meta linkage and no
-        // inner-activity stream.
+        // inner-activity stream. The Agent call runs its full lifecycle;
+        // AgentSwarm arrives already completed (first-sight-terminal path).
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,
           update: {
@@ -791,15 +810,39 @@ const program = Effect.gen(function* () {
             toolCallId: "0:tool_agent_1",
             title: "Agent",
             kind: "read",
-            status: "completed",
-            content: [
-              {
-                type: "content",
-                content: { type: "text", text: "agent_id: agent-123 finished review" },
-              },
-            ],
+            status: "pending",
+            content: [],
           },
         });
+        // rawInput rides on the raw notification: the typed client schema
+        // drops unknown fields.
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "0:tool_agent_1",
+            title: "Agent",
+            status: "in_progress",
+            rawInput: { prompt: "review config tests" },
+            content: [],
+          },
+        });
+        if (!leaveKimiSubagentOpen) {
+          yield* agent.client.sessionUpdate({
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "0:tool_agent_1",
+              status: "completed",
+              content: [
+                {
+                  type: "content",
+                  content: { type: "text", text: "agent_id: agent-123 finished review" },
+                },
+              ],
+            },
+          });
+        }
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,
           update: {

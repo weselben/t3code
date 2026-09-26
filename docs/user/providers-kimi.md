@@ -28,24 +28,27 @@ runs.
   takes effect without a restart.
 - **Plan mode.** Use the thread's Plan/Build toggle. Plan maps to Kimi's read-only Plan mode.
 - **Sub-agents.** When Kimi dispatches an `Agent` or an `AgentSwarm`, the thread shows a spawn
-  row. Kimi keeps sub-agent work isolated, so you see the dispatch and the final result, not the
-  inner tool calls.
+  row with its running and finished state, and the dispatch appears in the Agents panel with its
+  start and end status. Kimi keeps sub-agent work isolated, so you see the dispatch and the final
+  result, not the inner tool calls.
+- **Background updates.** When Kimi reports background work back into the session, the thread
+  shows it as an agent message, so you see the result without asking.
 - **Questions.** When Kimi asks you a question or requests a tool approval, the thread shows the
   same question panel and approval controls as other providers.
 
 ## Commands
 
-Type `/` in the composer to see Kimi's remote commands, for example `/compact`, `/status`,
-`/usage`, `/tasks`, and your Kimi skills. Commands that only make sense inside the Kimi terminal
-UI, such as `/theme`, are not offered.
+Type `/` in the composer to see Kimi's commands — for example `/compact`, `/status`, `/usage`,
+`/tasks`, and your Kimi skills.
+
+**Synthetic commands.** `/plan <task>` plans the task read-only for that turn. The thread returns
+to its previous mode afterwards; use the thread's Plan/Build toggle to plan across several turns.
+`/goal <objective>` starts a goal Kimi keeps working toward. `/swarm` and `/theme` only exist in
+the Kimi terminal and are not available here.
 
 ## Known limits
 
-- Kimi's `/goal` and `/plan` commands are terminal-only (confirmed through Kimi Code CLI 2.0.x)
-  and are not reachable from T3 Code. Typing them anyway makes Kimi answer with an
-  "Unknown ACP command" error. For plan mode use the thread's Plan/Build toggle, which maps to
-  Kimi's Plan mode. For goals, ask for one in plain language ("create a goal for ...") — the
-  CreateGoal tool works over ACP.
+- Cron reminders fire inside Kimi, but their output does not appear in the thread yet.
 - Kimi has no separate "accept edits" permission level. The approval modes map to Kimi's
   Default, Auto, and YOLO modes.
 - Updates are manual: run `kimi upgrade` on the server machine.
